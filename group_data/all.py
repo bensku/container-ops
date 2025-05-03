@@ -13,7 +13,8 @@ with open(ssh_config_file, 'r') as f:
     lines = f.readlines()
     current_host = None
     for line in lines:
-        if line.startswith('Host'):
-            current_host = line.split(' ')[1]
-        elif line.startswith('HostName'):
+        line = line.strip()
+        if line.startswith('HostName'):
             ip_addresses[current_host] = line.split(' ')[1]
+        elif line.startswith('Host'):
+            current_host = line.split(' ')[1]

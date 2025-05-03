@@ -54,7 +54,7 @@ HOST_NAT = Network(handler='podman_host_nat', args={})
 
 
 @operation()
-def pod(pod_name: str, containers: list[Container], networks: list[Network], ports: list[tuple[str, str, str]], present: bool = True):
+def pod(pod_name: str, containers: list[Container], networks: list[Network], ports: list[tuple[str, str, str]] = [], present: bool = True):
     if not present:
         # TODO Remove containers and network containers before the pod or network!
         return
@@ -108,7 +108,7 @@ def container(spec: Container, pod_name: str = None):
     # Upload container configuration files
     for v in spec.volumes:
         if type(v[0]) == ConfigFile:
-            yield from files.put._inner(src=StringIO(v[0].data), dest=f'/etc/container-configs/{v[0].id}')
+            yield from files.put._inner(src=StringIO(v[0].data), dest=f'/etc/containerops/configs/{v[0].id}')
 
     unit = f"""[Unit]
 Description={f'{pod_name} - {spec.name}' if pod_name else spec.name}
@@ -118,7 +118,7 @@ Description={f'{pod_name} - {spec.name}' if pod_name else spec.name}
 ContainerName={service_name}
 Image={spec.image}
 {f'Pod={pod_name}.pod' if pod_name else ''}
-{'\n'.join([f'Volume={f'/etc/container-configs/{v[0].id}' if type(v[0]) == ConfigFile else v[0]}:{v[1]}' for v in spec.volumes])}
+{'\n'.join([f'Volume={f'/etc/containerops/configs/{v[0].id}' if type(v[0]) == ConfigFile else v[0]}:{v[1]}' for v in spec.volumes])}
 {'\n'.join([f'Environment={e[0]}={e[1]}' for e in spec.environment])}
 
 {f'Entrypoint={spec.entrypoint}' if spec.entrypoint else ''}
