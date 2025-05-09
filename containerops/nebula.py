@@ -8,6 +8,8 @@ from pyinfra.api import operation, StringCommand, FunctionCommand, FileUploadCom
 from pyinfra.operations import files, systemd, server
 from pyinfra.facts.files import Sha256File, Sha1File
 
+from containerops import podman
+
 
 NEBULA_DOWNLOAD = 'https://github.com/slackhq/nebula/releases/download/v1.9.5/nebula-linux-amd64.tar.gz'
 NEBULA_HASH = 'af57ded8f3370f0486bb24011942924b361d77fa34e3478995b196a5441dbf71'
@@ -15,9 +17,26 @@ NEBULA_HASH = 'af57ded8f3370f0486bb24011942924b361d77fa34e3478995b196a5441dbf71'
 
 @dataclass
 class Network:
+    """
+    Nebula network configuration. This should be shared between CA and
+    all certificates/endpoints.
+    
+    Arguments:
+        name: Name of the network.
+        dns_domain: DNS domain of the network.
+        prefix_len: Network prefix length.
+        epoch: Epoch. Initially, this should be set to 1. This can be increased
+            to re-create certificates. Note that certificate renewal is likely
+            to require manual work due to insufficient testing.
+        lighthouses: List of lighthouses and their addresses. These do not need
+            to be set to create CA or certificates, but should be set when
+            actual endpoints are created.
+    """
+
     name: str
-    epoch: int
+    dns_domain: str
     prefix_len: int
+    epoch: int
     lighthouses: list[tuple[str, str]] = field(repr=False)
 
     def state(self):
@@ -39,6 +58,23 @@ class Firewall:
 
 @operation()
 def ca(network: Network, duration: str = '876000h'):
+    """
+    Create a Nebula certificate authority on the current host.
+
+    The CA key and certificate will be stored at
+    /opt/containerops/nebula/nebula-cert. If you used this operation on
+    a remote server, you should copy them to same location on your Pyinfra
+    host.
+
+    Arguments:
+        network: Network definition. This should be same that will be used for
+            creating certificates and endpoints. The lighthouses do not need to
+            actually exist yet.
+        duration: CA validity. Defaults to practically forever, but if you can
+            rotate certificates on all endpoints, setting this to lower would
+            be more secure.
+    """
+
     yield from _ensure_installed()
     cert_dir = f'/etc/containerops/nebula/networks/{network.name}/ca/{network.epoch}'
     yield StringCommand(f'mkdir -p "{cert_dir}"')
@@ -50,6 +86,18 @@ def ca(network: Network, duration: str = '876000h'):
 
 @operation()
 def certificate(network: Network, hostname: str, ip: str, groups: list[str] = []):
+    """
+    Create a Nebula certificate for an endpoint. This is useful when you do not
+    wish to use Pyinfra to configure the endpoint (e.g. mobile devices).
+
+    The certificate will be created LOCALLY, and require network CA to
+    be available. Make sure that your user has write access to
+    /opt/containerops/nebula directory.
+
+    The created certificates can be found at
+    /etc/containerops/nebula/networks/<network name>/endpoint/<hostname>.
+    """
+
     yield from _ensure_installed()
     # Generate the certificate locally
     ca_dir = f'/etc/containerops/nebula/networks/{network.name}/ca/{network.epoch}'
@@ -110,6 +158,30 @@ def endpoint(
         pod: str = None,
         present: bool = True
     ):
+    """
+    Create an endpoint to attach the current host to a Nebula network.
+
+    Arguments:
+        network: Network configuration.
+        hostname: Hostname of the endpoint.
+            Lighthouses will answer for DNS queries about this name.
+        ip: Endpoint IP address. Must be unique within Nebula network!
+        firewall: Firewall configuration. Empty firewall means nothing is allowed!
+        create_cert: Whether to create a certificate for the endpoint.
+            Defaults to true. If true, the CA must be available locally.
+        is_lighthouse: Whether this endpoint is a lighthouse. This should
+            be set only for the network's configured lighthouses!
+        underlay_port: Port to use for encrypted UDP traffic. This must be
+            permitted by the host machine's firewall. Defaults to a random
+            port picked by the host kernel, which is usually fine.
+            For lighthouses, this must be set to the port listed for them in
+            the network configuration!
+        pod: If set, this endpoint will be created within a Podman pod.
+            If the pod has been deployed with container-ops, use
+            nebula.pod_endpoint() instead to get functional DNS for free!
+        present: By default, the endpoint is created.
+            If set to False, it will be removed instead.
+    """
     if not present:
         # Remove endpoint
         yield StringCommand(f'rm -rf /etc/containerops/nebula/networks/{network.name}/endpoint/{hostname}')
@@ -212,24 +284,25 @@ def _nebula_unit(network: Network, hostname: str, config_path: str, target_pod: 
     return f'''
 [Unit]
 Description=Nebula overlay - {hostname} ({network.name})
+Wants=network-online.target
+After=network-online.target
 {f'Requires={target_pod}-pod.service\nAfter={target_pod}-pod.service' if target_pod else ''}
 
 [Service]
-ExecStartPre=/opt/containerops/nebula/nebula -test -config {config_path}
-ExecStart=/opt/containerops/nebula/nebula -config {config_path}
-{f'ExecStartPost=/opt/containerops/nebula_nic.sh {target_pod}-infra nebula{hostname[:8]}' if target_pod else ''}
+ExecStartPre=/opt/containerops/nebula/nebula-container -test -config {config_path}
+ExecStart={f'/opt/containerops/nebula/container-launch.sh {target_pod}-infra' if target_pod else '/opt/containerops/nebula/nebula-container'} -config {config_path}
 ExecReload=/bin/kill -HUP $MAINPID
 
-RuntimeDirectory=nebula
-ConfigurationDirectory=nebula
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-ProtectControlGroups=true
-ProtectHome=true
-ProtectKernelTunables=true
-ProtectSystem=full
-User=nebula
-Group=nebula
+# RuntimeDirectory=nebula
+# ConfigurationDirectory=nebula
+# CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+# AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+# ProtectControlGroups=true
+# ProtectHome=true
+# ProtectKernelTunables=true
+# ProtectSystem=full
+User=root
+Group=root
 
 SyslogIdentifier=nebula
 
@@ -246,17 +319,37 @@ WantedBy=multi-user.target
 '''
 
 
-NEBULA_NIC_SCRIPT = '''
-#!/bin/bash
-# Usage: ./move_nic.sh <container_name> <host_nic>
+def _pod_handler(network: Network, hostname: str, ip: str, firewall: Firewall,
+                 pod: str, present: bool):
+    yield from endpoint._inner(network, hostname=hostname, ip=ip, firewall=firewall, pod=pod, present=present)
 
-if [ "$#" -ne 2 ]; then
-  echo "Usage: $0 <container_name> <host_nic>"
-  exit 1
-fi
+
+def pod_endpoint(network: Network, hostname: str, ip: str, firewall: Firewall):
+    """
+    Create an endpoint that can be used to attach a pod to a Nebula network.
+
+    When added to a pod's networks list, this allows it to access the Nebula
+    network according to the given firewall rules. Pod DNS is also configured
+    to resolve names under network's DNS domain to other endpoints.
+
+    Arguments:
+        network: Network configuration.
+        hostname: Hostname of the endpoint.
+            Lighthouses will answer for DNS queries about this name.
+        ip: Endpoint IP address. Must be unique within Nebula network!
+        firewall: Firewall configuration. Empty firewall means nothing is allowed!s
+    """
+    return podman.Network(
+        name=f'nebula:{hostname}',
+        handler=_pod_handler,
+        args={'network': network, 'hostname': hostname, 'ip': ip, 'firewall': firewall},
+        dns_domain=network.dns_domain,
+        dns_servers=[lh[0] for lh in network.lighthouses]
+    )
+
+NEBULA_CONTAINER_SCRIPT = '''#!/bin/bash
 
 CONTAINER_NAME="$1"
-HOST_NIC="$2"
 
 # Wait for the container to be up and retrieve its PID.
 MAX_CONTAINER_WAIT=15  # Maximum seconds to wait for container startup
@@ -277,51 +370,10 @@ done
 
 echo "Container '$CONTAINER_NAME' is running with PID $CONTAINER_PID."
 
-# Wait for the host NIC to become available.
-MAX_NIC_WAIT=15  # Maximum seconds to wait for NIC availability
-WAITED_NIC=0
-echo "Waiting for interface '$HOST_NIC' to become available..."
-while ! ip link show "$HOST_NIC" &> /dev/null; do
-  sleep 1
-  WAITED_NIC=$((WAITED_NIC+1))
-  if [ $WAITED_NIC -ge $MAX_NIC_WAIT ]; then
-    echo "Error: Interface '$HOST_NIC' did not become available within $MAX_NIC_WAIT seconds."
-    exit 1
-  fi
-done
-
-echo "Interface '$HOST_NIC' is now available."
-
-# Capture the current IP addresses of the interface.
-IP4=$(ip -4 addr show "$HOST_NIC" | awk '/inet / {print $2; exit}')
-
-echo "Captured IP configuration:"
-[ -n "$IP4" ] && echo "  IPv4: $IP4" || echo "  No IPv4 address found."
-# Nebula does not use IPv6 for overlay, ignore it
-
-# Move the NIC into the container's network namespace.
-echo "Moving interface '$HOST_NIC' to container's network namespace..."
-ip link set "$HOST_NIC" netns "$CONTAINER_PID"
-if [ $? -ne 0 ]; then
-  echo "Failed to move interface '$HOST_NIC' to the container namespace."
-  exit 1
-fi
-
-# Reapply the saved IP addresses inside the container's network namespace using nsenter.
-echo "Reapplying IP configuration in the container's namespace..."
-if [ -n "$IP4" ]; then
-  nsenter --net=/proc/"$CONTAINER_PID"/ns/net ip addr add "$IP4" dev "$HOST_NIC"
-  if [ $? -ne 0 ]; then
-    echo "Failed to reassign IPv4 address $IP4 to interface '$HOST_NIC'."
-  else
-    echo "IPv4 address $IP4 reassigned."
-  fi
-fi
-
-# Bring the interface up in the container's network namespace.
-nsenter --net=/proc/"$CONTAINER_PID"/ns/net ip link set "$HOST_NIC" up
-
-echo "Interface '$HOST_NIC' successfully moved and configured in container '$CONTAINER_NAME'."
+# Launch Nebula with TUN inside the container's network namespace
+shift # Pass rest of arguments to Nebula
+echo "Executing Nebula..."
+exec /opt/containerops/nebula/nebula-container -netns /proc/"$CONTAINER_PID"/ns/net $@
 '''
 
 
@@ -331,4 +383,6 @@ def _ensure_installed():
         yield StringCommand('mkdir -p /opt/containerops/nebula')
         yield from files.download._inner(src=NEBULA_DOWNLOAD, dest='/opt/containerops/nebula.tar.gz', sha256sum=NEBULA_HASH)
         yield StringCommand('tar xzf /opt/containerops/nebula.tar.gz -C /opt/containerops/nebula')
-    yield from files.put._inner(src=StringIO(NEBULA_NIC_SCRIPT), dest='/opt/containerops/nebula/move_nic.sh', mode='755')
+    # TODO download this from server, this won't work except for testing!
+    yield from files.put._inner(src='nebula-container/nebula-container', dest='/opt/containerops/nebula/nebula-container', mode='755')
+    yield from files.put._inner(src=StringIO(NEBULA_CONTAINER_SCRIPT), dest='/opt/containerops/nebula/container-launch.sh', mode='755')
