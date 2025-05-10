@@ -1,3 +1,4 @@
+from pyinfra import host
 from pyinfra.api import deploy
 import containerops.podman as podman
 
@@ -25,15 +26,32 @@ def deploy_with_net():
             podman.Container(
                 name='back',
                 image='docker.io/nginx:latest',
-                volumes=[(podman.ConfigFile(id='nginx-back', data=back_config), '/etc/nginx/conf.d/default.conf')]
+                volumes=[(podman.ConfigFile(id='nginx-back', data=back_config), '/etc/nginx/conf.d/default.conf')],
+                reload_signal='SIGHUP'
             ),
             podman.Container(
                 name='front',
                 image='docker.io/nginx:latest',
-                volumes=[(podman.ConfigFile(id='nginx-front', data=front_config), '/etc/nginx/conf.d/default.conf')]
+                volumes=[(podman.ConfigFile(id='nginx-front', data=front_config), '/etc/nginx/conf.d/default.conf')],
+                reload_signal='SIGHUP'
             )
         ], networks=[podman.HOST_NAT], ports=[('8081', '80')], present=True)
-    
+
+
+@deploy('Test secrets')
+def test_secrets():
+    podman.secret(secret_name='podman-test', source='tests/test_secret.json', json_key='foo', present=True)
+    podman.pod(pod_name='secret-test', containers=[
+            podman.Container(
+                name='main',
+                image='docker.io/nginx:latest',
+                secrets=[
+                    ('ENV_SECRET', 'podman-test')
+                ]
+            )
+        ], networks=[podman.HOST_NAT], ports=[('8083', '80')], present=True)
+
 
 deploy_with_net()
-# podman.pod(pod_name='no-network', containers=[], networks=[], present=True)
+if host.name == 'containerops-1':
+    test_secrets()
