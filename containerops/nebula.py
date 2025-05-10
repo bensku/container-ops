@@ -347,6 +347,7 @@ def pod_endpoint(network: Network, hostname: str, ip: str, firewall: Firewall):
         dns_servers=[lh[0] for lh in network.lighthouses]
     )
 
+
 NEBULA_CONTAINER_SCRIPT = '''#!/bin/bash
 
 CONTAINER_NAME="$1"

@@ -115,8 +115,22 @@ def pod(pod_name: str, containers: list[Container], networks: list[Network], por
     """
 
     if not present:
-        # TODO Remove containers and network containers before the pod or network!
+        # Remove ALL containers
+        yield from _remove_missing_containers(containers=[], pod_name=pod_name)
+        yield from _pod_dns(pod_name=pod_name, networks=[], present=False)
+
+        # Remove container-ops external networks
+        for net in networks:
+            if net.handler != 'podman_host_nat':
+                yield from net.handler(**net.args, pod=pod_name, present=False)
+
+        # Remove pod, then finally its network
+        yield from _install_service(unit_name=f'{pod_name}.pod', service_name=f'{pod_name}-pod', unit='', present=False)
+        yield StringCommand(f'podman pod rm -f {pod_name}') # Otherwise, it is just stopped for some reason?
+        yield from _install_service(unit_name=f'{pod_name}.network', service_name=f'{pod_name}-network', unit='', present=False)
+        yield StringCommand(f'podman network rm -f {pod_name}') # NetworkDeleteOnStop needs too new Podman
         return
+        
 
     # Deploy separate network so that we can control if it is internal or not
     net_unit = f"""[Unit]
@@ -128,7 +142,7 @@ Driver=bridge
 DisableDNS=true
 Internal={'false' if HOST_NAT in networks else 'true'}
 """
-    yield from _install_service(unit_name=f'{pod_name}.network', service_name=f'{pod_name}-network', unit=net_unit, present=present)
+    yield from _install_service(unit_name=f'{pod_name}.network', service_name=f'{pod_name}-network', unit=net_unit, present=True)
 
     # Deploy the actual pod
     pod_unit = f"""[Unit]
@@ -146,20 +160,13 @@ Restart=always
 [Install]
 WantedBy=multi-user.target default.target
 """
-    yield from _install_service(unit_name=f'{pod_name}.pod', service_name=f'{pod_name}-pod', unit=pod_unit, present=present)
+    yield from _install_service(unit_name=f'{pod_name}.pod', service_name=f'{pod_name}-pod', unit=pod_unit, present=True)
 
     # Deploy DNS container for multi-network support
-    yield from _pod_dns(pod_name=pod_name, networks=networks)
+    yield from _pod_dns(pod_name=pod_name, networks=networks, present=True)
 
     # Remove containers that are no longer present
-    container_names = set([container.name for container in containers])
-    unit_files = host.get_fact(FindFiles, path=f'/etc/containers/systemd')
-    for path in unit_files:
-        unit_name = os.path.basename(path)
-        if unit_name.endswith('.container') and unit_name.startswith(f'{pod_name}-') and not unit_name.endswith(f'{pod_name}-dns.container'):
-            container_name = unit_name[len(f'{pod_name}-'):-len('.container')]
-            if container_name not in container_names:
-                yield from _install_service(unit_name=unit_name, service_name=f'{pod_name}-{container_name}', unit='', present=False)
+    yield from _remove_missing_containers(containers=containers, pod_name=pod_name)
 
     # Deploy this pod's containers
     for spec in containers:
@@ -168,11 +175,10 @@ WantedBy=multi-user.target default.target
     # Deploy non-NAT networks
     for net in networks:
         if net.handler != 'podman_host_nat':
-            # TODO network deletion separately immediately after container deletion
             yield from net.handler(**net.args, pod=pod_name, present=True)
 
 
-def _pod_dns(pod_name: str, networks: list[Network]):
+def _pod_dns(pod_name: str, networks: list[Network], present: bool):
     config = f'''# Provide DNS to this pod only
 bind-interfaces
 interface=lo
@@ -190,9 +196,22 @@ server=1.1.1.1
     spec = Container(
         name='dns',
         image='ghcr.io/bensku/pigeon/dnsmasq', # TODO migrate image to this repo and pin tag
-        volumes=[(ConfigFile(id=f'{pod_name}-dns-config', data=config), '/etc/dnsmasq.conf')]
+        volumes=[(ConfigFile(id=f'{pod_name}-dns-config', data=config), '/etc/dnsmasq.conf')],
+        present=present
     )
     yield from container._inner(spec=spec, pod_name=pod_name)
+
+
+def _remove_missing_containers(containers: list[Container], pod_name: str):
+    container_names = set([container.name for container in containers])
+    unit_files = host.get_fact(FindFiles, path=f'/etc/containers/systemd')
+    for path in unit_files:
+        unit_name = os.path.basename(path)
+        if unit_name.endswith('.container') and unit_name.startswith(f'{pod_name}-') and not unit_name.endswith(f'{pod_name}-dns.container'):
+            container_name = unit_name[len(f'{pod_name}-'):-len('.container')]
+            if container_name not in container_names:
+                yield from _install_service(unit_name=unit_name, service_name=f'{pod_name}-{container_name}', unit='', present=False)
+
 
 
 @operation()
@@ -200,10 +219,13 @@ def container(spec: Container, pod_name: str = None):
     pod_prefix = f'{pod_name}-' if pod_name else ''
     service_name = f'{pod_prefix}{spec.name}'
 
-    # Upload container configuration files
+    # Upload container configuration files (or remove them)
     for v in spec.volumes:
         if type(v[0]) == ConfigFile:
-            yield from files.put._inner(src=StringIO(v[0].data), dest=f'/etc/containerops/configs/{v[0].id}')
+            if spec.present:
+                yield from files.put._inner(src=StringIO(v[0].data), dest=f'/etc/containerops/configs/{v[0].id}')
+            else:
+                yield StringCommand(f'rm -f "/etc/containerops/configs/{v[0].id}"')
 
     unit = f"""[Unit]
 Description={f'{pod_name} - {spec.name}' if pod_name else spec.name}
@@ -248,5 +270,5 @@ def _install_service(unit_name: str, service_name: str, unit: str, present: bool
         # Uninstall the systemd service
         yield StringCommand(f'rm -f "{remote_path}"')
         yield from systemd.daemon_reload._inner()
-        yield from systemd.service._inner(service=service_name, running=False)
+        yield from systemd.service._inner(service=service_name, running=False, daemon_reload=True)
 
