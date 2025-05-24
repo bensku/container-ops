@@ -98,7 +98,7 @@ class ConfigFile:
         id: Id of the configuration file. This must be unique between ALL
         containers running on same machine.
         data: Configuration file content.
-        needs_restart: By default, the container this is mounted to is
+        needs_reload: By default, the container this is mounted to is
             reloaded when the file contents change. When set to False, the
             application inside must detect the change by itself.
     """
@@ -236,6 +236,7 @@ def container(spec: Container, pod_name: str = None):
 
     # Upload container configuration files (or remove them)
     config_needs_reload = False
+    dir_created = False
     for v in spec.volumes:
         if type(v[0]) == ConfigFile:
             if spec.present:
@@ -244,6 +245,9 @@ def container(spec: Container, pod_name: str = None):
                 remote_path = f'/etc/containerops/configs/{v[0].id}'
                 remote_hash = host.get_fact(Sha1File, path=remote_path)
                 if local_hash != remote_hash:
+                    if not dir_created:
+                        yield StringCommand('mkdir -p "/etc/containerops/configs"')
+                        dir_created = True
                     yield FileUploadCommand(src=new_config, dest=remote_path, remote_temp_filename=host.get_temp_filename(remote_path))
                     if v[0].needs_reload:
                         config_needs_reload = True
@@ -268,7 +272,7 @@ Image={spec.image}
 {'\n'.join([f'Environment={secret_ids[i]},type=env,target={secret[0]}' for i, secret in enumerate(spec.secrets)])}
 
 {f'Entrypoint={spec.entrypoint}' if spec.entrypoint else ''}
-{f'Command={spec.command}' if spec.command else ''}
+{f'Exec={spec.command}' if spec.command else ''}
 
 {'\n'.join([f'AddCapability={c}' for c in spec.linuxCapabilities])}
 {'\n'.join([f'AddDevice={d}' for d in spec.linuxDevices])}
@@ -323,7 +327,9 @@ def secret(secret_name: str, source: str, json_key: str = None, present: bool = 
         with open(source, 'r') as f:
             data = f.read()
         value = json.loads(data)[json_key] if json_key else data
-        old_value = host.get_fact(Command, f'podman secret inspect {secret_name} --format "{{{{.SecretData}}}}" --showsecret || true').strip()
+        old_value = host.get_fact(Command, f'podman secret inspect {secret_name} --format "{{{{.SecretData}}}}" --showsecret || true')
+        if old_value:
+            old_value = old_value.strip()
         if value != old_value:
             yield StringCommand('echo -n', MaskString(f'"{value}"'), '|', 'podman secret create --replace', secret_name, '-')
     else:

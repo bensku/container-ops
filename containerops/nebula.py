@@ -8,7 +8,7 @@ from pyinfra.api import operation, StringCommand, FunctionCommand, FileUploadCom
 from pyinfra.operations import files, systemd, server
 from pyinfra.facts.files import Sha256File, Sha1File
 
-from containerops import podman
+from containerops import podman, _ipam as ipam
 
 
 NEBULA_DOWNLOAD = 'https://github.com/slackhq/nebula/releases/download/v1.9.5/nebula-linux-amd64.tar.gz'
@@ -24,7 +24,7 @@ class Network:
     Arguments:
         name: Name of the network.
         dns_domain: DNS domain of the network.
-        prefix_len: Network prefix length.
+        cidr: Network range in CIDR format.
         epoch: Epoch. Initially, this should be set to 1. This can be increased
             to re-create certificates. Note that certificate renewal is likely
             to require manual work due to insufficient testing.
@@ -35,12 +35,16 @@ class Network:
 
     name: str
     dns_domain: str
-    prefix_len: int
+    cidr: str
     epoch: int
     lighthouses: list[tuple[str, str]] = field(repr=False)
 
     def state(self):
         return f'{self.name}-{self.epoch}'
+    
+    @property
+    def prefix_len(self) -> int:
+        return int(self.cidr.split('/')[1])
 
 
 @dataclass
@@ -150,8 +154,9 @@ def _update_state(cert_dir: str, state: str):
 def endpoint(
         network: Network,
         hostname: str,
-        ip: str,
         firewall: Firewall,
+        ip: str = None,
+        groups: list[str] = [],
         create_cert: bool = True,
         is_lighthouse: bool = False,
         underlay_port: int = 0,
@@ -165,8 +170,11 @@ def endpoint(
         network: Network configuration.
         hostname: Hostname of the endpoint.
             Lighthouses will answer for DNS queries about this name.
-        ip: Endpoint IP address. Must be unique within Nebula network!
         firewall: Firewall configuration. Empty firewall means nothing is allowed!
+        ip: Endpoint IP address. Optional, but must be unique within network
+            if present. When not given, a random address is assigned with IPAM.
+        groups: Groups of the endpoint. Other endpoints can refer to them in
+            their firewalls.
         create_cert: Whether to create a certificate for the endpoint.
             Defaults to true. If true, the CA must be available locally.
         is_lighthouse: Whether this endpoint is a lighthouse. This should
@@ -182,6 +190,15 @@ def endpoint(
         present: By default, the endpoint is created.
             If set to False, it will be removed instead.
     """
+    # Make sure that we have IP and (even if statically set) it is unique
+    ip = ipam.allocate_ip(
+        network_name=network.name,
+        hostname=hostname,
+        cidr=network.cidr,
+        present=present,
+        ip=ip,
+    )
+
     if not present:
         # Remove endpoint
         yield StringCommand(f'rm -rf /etc/containerops/nebula/networks/{network.name}/endpoint/{hostname}')
@@ -190,7 +207,7 @@ def endpoint(
         return
 
     if create_cert:
-        yield from certificate._inner(network, hostname, ip)
+        yield from certificate._inner(network, hostname, ip, groups)
 
     config = StringIO(json.dumps(_nebula_config(network, hostname, ip, is_lighthouse, underlay_port, firewall), indent=4, sort_keys=True))
     config_path = f'/etc/containerops/nebula/networks/{network.name}/endpoint/{hostname}/config.json'
@@ -319,12 +336,12 @@ WantedBy=multi-user.target
 '''
 
 
-def _pod_handler(network: Network, hostname: str, ip: str, firewall: Firewall,
+def _pod_handler(network: Network, hostname: str, ip: str, groups: list[str], firewall: Firewall,
                  pod: str, present: bool):
     yield from endpoint._inner(network, hostname=hostname, ip=ip, firewall=firewall, pod=pod, present=present)
 
 
-def pod_endpoint(network: Network, hostname: str, ip: str, firewall: Firewall):
+def pod_endpoint(network: Network, hostname: str, firewall: Firewall, ip: str = None, groups: list[str] = []):
     """
     Create an endpoint that can be used to attach a pod to a Nebula network.
 
@@ -336,13 +353,16 @@ def pod_endpoint(network: Network, hostname: str, ip: str, firewall: Firewall):
         network: Network configuration.
         hostname: Hostname of the endpoint.
             Lighthouses will answer for DNS queries about this name.
-        ip: Endpoint IP address. Must be unique within Nebula network!
         firewall: Firewall configuration. Empty firewall means nothing is allowed!s
+        ip: Endpoint IP address. Optional, but must be unique within network
+            if present. When not given, a random address is assigned with IPAM.
+        groups: Groups of the endpoint. Other endpoints can refer to them in
+            their firewalls.
     """
     return podman.Network(
         name=f'nebula:{hostname}',
         handler=_pod_handler,
-        args={'network': network, 'hostname': hostname, 'ip': ip, 'firewall': firewall},
+        args={'network': network, 'hostname': hostname, 'ip': ip, 'groups': groups, 'firewall': firewall},
         dns_domain=network.dns_domain,
         dns_servers=[lh[0] for lh in network.lighthouses]
     )
