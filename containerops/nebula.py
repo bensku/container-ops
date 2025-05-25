@@ -8,7 +8,7 @@ from pyinfra.api import operation, StringCommand, FunctionCommand, FileUploadCom
 from pyinfra.operations import files, systemd, server
 from pyinfra.facts.files import Sha256File, Sha1File
 
-from containerops import podman, _ipam as ipam
+from containerops import podman, _ipam as ipam, _port_alloc as port_alloc
 
 
 NEBULA_DOWNLOAD = 'https://github.com/slackhq/nebula/releases/download/v1.9.5/nebula-linux-amd64.tar.gz'
@@ -31,13 +31,18 @@ class Network:
         lighthouses: List of lighthouses and their addresses. These do not need
             to be set to create CA or certificates, but should be set when
             actual endpoints are created.
+        underlay_port_range: Port range to use for encrypted UDP traffic of
+            endpoints. Each endpoint may explicitly specify its own port,
+            overriding this.
     """
 
     name: str
-    dns_domain: str
+    dns_domain: str = field(repr=False)
     cidr: str
     epoch: int
     lighthouses: list[tuple[str, str]] = field(repr=False)
+
+    underlay_port_range: tuple[int, int] = field(default=(12500, 13000), repr=False)
 
     def state(self):
         return f'{self.name}-{self.epoch}'
@@ -159,7 +164,7 @@ def endpoint(
         groups: list[str] = [],
         create_cert: bool = True,
         is_lighthouse: bool = False,
-        underlay_port: int = 0,
+        underlay_port: int = None,
         pod: str = None,
         present: bool = True
     ):
@@ -180,10 +185,13 @@ def endpoint(
         is_lighthouse: Whether this endpoint is a lighthouse. This should
             be set only for the network's configured lighthouses!
         underlay_port: Port to use for encrypted UDP traffic. This must be
-            permitted by the host machine's firewall. Defaults to a random
-            port picked by the host kernel, which is usually fine.
-            For lighthouses, this must be set to the port listed for them in
-            the network configuration!
+            permitted by the host machine's firewall. Defaults to an unique
+            port within network's allowed underlay port range (which, in turn,
+            defaults to 12500-13000). If set to 0, the port will be picked by
+            kernel, which may significantly complete firewall configuration.
+            Finally, if set to a non-zero number, that port will be used and
+            must be available. For lighthouses, a non-zero ports must be
+            explicitly set and they must match their port in network configuration!
         pod: If set, this endpoint will be created within a Podman pod.
             If the pod has been deployed with container-ops, use
             nebula.pod_endpoint() instead to get functional DNS for free!
@@ -198,6 +206,16 @@ def endpoint(
         present=present,
         ip=ip,
     )
+    # If no underlay port was given, allocate one dynamically
+    # If port WAS given, assume that user knows what they're doing and do not validate anything
+    if underlay_port is None:
+        underlay_port = port_alloc.allocate_port(
+            network_name=network.name,
+            machine_id=host.name, # Name of the server we're deploying to
+            hostname=hostname, # Endpoint hostname (lighthouse DNS name), has no relation to Pyinfra host.name
+            port_range=network.underlay_port_range,
+            present=present
+        )
 
     if not present:
         # Remove endpoint
