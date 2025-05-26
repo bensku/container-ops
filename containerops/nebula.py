@@ -5,7 +5,7 @@ import os
 import subprocess
 from pyinfra import host
 from pyinfra.api import operation, StringCommand, FunctionCommand, FileUploadCommand
-from pyinfra.operations import files, systemd, server
+from pyinfra.operations import files, systemd, server, selinux
 from pyinfra.facts.files import Sha256File, Sha1File
 
 from containerops import podman, _ipam as ipam, _port_alloc as port_alloc
@@ -13,6 +13,10 @@ from containerops import podman, _ipam as ipam, _port_alloc as port_alloc
 
 NEBULA_DOWNLOAD = 'https://github.com/slackhq/nebula/releases/download/v1.9.5/nebula-linux-amd64.tar.gz'
 NEBULA_HASH = 'af57ded8f3370f0486bb24011942924b361d77fa34e3478995b196a5441dbf71'
+
+# TODO arm64 support
+NEBULA_NETNS_DOWNLOAD = 'https://github.com/bensku/nebula-netns/releases/download/v1.9.5-netns0/nebula-netns-linux-amd64'
+CONTAINER_NEBULA_DOWNLOAD = 'https://github.com/bensku/nebula-netns/releases/download/v1.9.5-netns0/container-nebula.sh'
 
 
 @dataclass
@@ -84,7 +88,7 @@ def ca(network: Network, duration: str = '876000h'):
             be more secure.
     """
 
-    yield from _ensure_installed()
+    yield from _ensure_installed(install_tools=True)
     cert_dir = f'/etc/containerops/nebula/networks/{network.name}/ca/{network.epoch}'
     yield StringCommand(f'mkdir -p "{cert_dir}"')
     yield StringCommand(
@@ -107,7 +111,7 @@ def certificate(network: Network, hostname: str, ip: str, groups: list[str] = []
     /etc/containerops/nebula/networks/<network name>/endpoint/<hostname>.
     """
 
-    yield from _ensure_installed()
+    yield from _ensure_installed(install_tools=False)
     # Generate the certificate locally
     ca_dir = f'/etc/containerops/nebula/networks/{network.name}/ca/{network.epoch}'
     cert_dir = f'/etc/containerops/nebula/networks/{network.name}/endpoint/{hostname}'
@@ -324,9 +328,10 @@ After=network-online.target
 {f'Requires={target_pod}-pod.service\nAfter={target_pod}-pod.service' if target_pod else ''}
 
 [Service]
-ExecStartPre=/opt/containerops/nebula/nebula-container -test -config {config_path}
-ExecStart={f'/opt/containerops/nebula/container-launch.sh {target_pod}-infra' if target_pod else '/opt/containerops/nebula/nebula-container'} -config {config_path}
+ExecStartPre=/opt/containerops/nebula/nebula-netns -test -config {config_path}
+ExecStart={f'/opt/containerops/nebula/container-nebula.sh {target_pod}-infra' if target_pod else '/opt/containerops/nebula/nebula-netns'} -config {config_path}
 ExecReload=/bin/kill -HUP $MAINPID
+Environment="NEBULA_NETNS_BINARY=/opt/containerops/nebula/nebula-netns"
 
 # RuntimeDirectory=nebula
 # ConfigurationDirectory=nebula
@@ -386,42 +391,17 @@ def pod_endpoint(network: Network, hostname: str, firewall: Firewall, ip: str = 
     )
 
 
-NEBULA_CONTAINER_SCRIPT = '''#!/bin/bash
-
-CONTAINER_NAME="$1"
-
-# Wait for the container to be up and retrieve its PID.
-MAX_CONTAINER_WAIT=15  # Maximum seconds to wait for container startup
-WAITED_CONTAINER=0
-echo "Waiting for container '$CONTAINER_NAME' to be up..."
-while true; do
-  CONTAINER_PID=$(podman inspect --format '{{.State.Pid}}' "$CONTAINER_NAME" 2>/dev/null)
-  if [ -n "$CONTAINER_PID" ] && [ "$CONTAINER_PID" -gt 0 ]; then
-    break
-  fi
-  sleep 1
-  WAITED_CONTAINER=$((WAITED_CONTAINER+1))
-  if [ $WAITED_CONTAINER -ge $MAX_CONTAINER_WAIT ]; then
-    echo "Error: Container '$CONTAINER_NAME' did not start within $MAX_CONTAINER_WAIT seconds."
-    exit 1
-  fi
-done
-
-echo "Container '$CONTAINER_NAME' is running with PID $CONTAINER_PID."
-
-# Launch Nebula with TUN inside the container's network namespace
-shift # Pass rest of arguments to Nebula
-echo "Executing Nebula..."
-exec /opt/containerops/nebula/nebula-container -netns /proc/"$CONTAINER_PID"/ns/net $@
-'''
-
-
-def _ensure_installed():
+def _ensure_installed(install_tools: bool):
     yield from server.user._inner(user='nebula', system=True, create_home=False)
-    if host.get_fact(Sha256File, path='/opt/containerops/nebula.tar.gz') != NEBULA_HASH:
-        yield StringCommand('mkdir -p /opt/containerops/nebula')
+    yield StringCommand('mkdir -p /opt/containerops/nebula')
+
+    # If desired, install vanilla Nebula for nebula-cert
+    if install_tools and host.get_fact(Sha256File, path='/opt/containerops/nebula.tar.gz') != NEBULA_HASH:
         yield from files.download._inner(src=NEBULA_DOWNLOAD, dest='/opt/containerops/nebula.tar.gz', sha256sum=NEBULA_HASH)
         yield StringCommand('tar xzf /opt/containerops/nebula.tar.gz -C /opt/containerops/nebula')
-    # TODO download this from server, this won't work except for testing!
-    yield from files.put._inner(src='nebula-container/nebula-container', dest='/opt/containerops/nebula/nebula-container', mode='755')
-    yield from files.put._inner(src=StringIO(NEBULA_CONTAINER_SCRIPT), dest='/opt/containerops/nebula/container-launch.sh', mode='755')
+
+    # Install nebula-netns for container networking support
+    yield from files.download._inner(src=NEBULA_NETNS_DOWNLOAD, dest='/opt/containerops/nebula/nebula-netns', mode='755')
+    yield from selinux.file_context._inner(path='/opt/containerops/nebula/nebula-netns', se_type='bin_t')
+    yield from files.download._inner(src=CONTAINER_NEBULA_DOWNLOAD, dest='/opt/containerops/nebula/container-nebula.sh', mode='755')
+    yield from selinux.file_context._inner(path='/opt/containerops/nebula/container-nebula.sh', se_type='bin_t')
