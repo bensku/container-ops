@@ -150,7 +150,7 @@ def _new_cert(hostname: str, ip: str, prefix_len: int, ca_dir: str, cert_dir: st
     except OSError:
         pass
 
-    groups_opt = ','.join(groups) if len(groups) > 0 else ''
+    groups_opt = '-groups ' + ','.join(groups) if len(groups) > 0 else ''
     subprocess.run(f'/opt/containerops/nebula/nebula-cert sign -name "{hostname}" -ip {ip}/{prefix_len} {groups_opt} -ca-crt "{ca_dir}/ca.crt" -ca-key "{ca_dir}/ca.key" -out-crt "{cert_dir}/host.crt" -out-key "{cert_dir}/host.key" -out-qr "{cert_dir}/host-qrcode.png"', check=True, shell=True)
 
 
@@ -202,6 +202,9 @@ def endpoint(
         present: By default, the endpoint is created.
             If set to False, it will be removed instead.
     """
+    if not hostname.endswith(network.dns_domain):
+        raise ValueError(f'hostname {hostname} does not belong to network DNS domain {network.dns_domain}')
+
     # Make sure that we have IP and (even if statically set) it is unique
     ip = ipam.allocate_ip(
         network_name=network.name,
@@ -227,6 +230,10 @@ def endpoint(
         yield StringCommand(f'rm -f /etc/systemd/system/nebula-{hostname}.service')
         yield from systemd.service._inner(service=f'nebula-{hostname}.service', enabled=False, running=False, daemon_reload=True)
         return
+
+    if is_lighthouse:
+        # Mark lighthouses, we'll permit DNS traffic towards them even if everything else is blocked
+        groups += ['_lighthouse']
 
     if create_cert:
         yield from certificate._inner(network, hostname, ip, groups)
@@ -256,6 +263,9 @@ def endpoint(
 def _nebula_config(network: Network, hostname: str, ip: str, is_lighthouse: bool, underlay_port: int, firewall: Firewall):
     ca_dir = f'/etc/containerops/nebula/networks/{network.name}/ca/{network.epoch}'
     cert_dir = f'/etc/containerops/nebula/networks/{network.name}/endpoint/{hostname}'
+
+    # Make sure the firewall permits essential things like our internal DNS!
+    firewall = _patch_firewall(firewall)
 
     lighthouse_map = {}
     for lh in network.lighthouses:
@@ -293,8 +303,8 @@ def _nebula_config(network: Network, hostname: str, ip: str, is_lighthouse: bool
         },
         # Convert our firewall rule definitions to Nebula format
         'firewall': {
-            'inbound': list([_convert_fw_rule(rule) for rule in firewall.inbound]),
-            'outbound': list([_convert_fw_rule(rule) for rule in firewall.outbound]),
+            'inbound': list([item for rule in firewall.inbound for item in _convert_fw_rule(rule)]),
+            'outbound': list([item for rule in firewall.outbound for item in _convert_fw_rule(rule)]),
         },
         'logging': {
             'level': 'info', # TODO debug logging support
@@ -303,19 +313,30 @@ def _nebula_config(network: Network, hostname: str, ip: str, is_lighthouse: bool
     }
 
 
+def _patch_firewall(firewall: Firewall) -> Firewall:
+    permit_dns = [FirewallRule(53, '_lighthouse')]
+    return Firewall(
+        inbound=firewall.inbound,
+        outbound=firewall.outbound + permit_dns,
+    )
+
+
 def _convert_fw_rule(rule: FirewallRule):
     if rule.groups == 'any' or rule.groups == ['any']:
-        return {
+        return [{
             'port': rule.port,
             'host': 'any',
             'proto': rule.protocol,
-        }
+        }]
     else:
-        return {
+        # With Nebula firewall, if a rule specifies multiple groups, ALL of them must be present for rule to match
+        # In author's opinion, this is an annoying footgun, so we make one rule per group specified
+        groups = [rule.groups] if isinstance(rule.groups, str) else rule.groups
+        return [{
             'port': rule.port,
-            'groups': [rule.groups] if isinstance(rule.groups, str) else rule.groups,
+            'group': group,
             'proto': rule.protocol,
-        }
+        } for group in groups]
 
 
 def _nebula_unit(network: Network, hostname: str, config_path: str, target_pod: str = None):
@@ -361,7 +382,7 @@ WantedBy=multi-user.target
 
 def _pod_handler(network: Network, hostname: str, ip: str, groups: list[str], firewall: Firewall,
                  pod: str, present: bool):
-    yield from endpoint._inner(network, hostname=hostname, ip=ip, firewall=firewall, pod=pod, present=present)
+    yield from endpoint._inner(network, hostname=hostname, ip=ip, groups=groups, firewall=firewall, pod=pod, present=present)
 
 
 def pod_endpoint(network: Network, hostname: str, firewall: Firewall, ip: str = None, groups: list[str] = []):

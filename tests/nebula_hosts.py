@@ -10,6 +10,7 @@ def management_net():
         network=net_config, 
         hostname=f'{host.name}.containerops.test',
         ip=host.data.nebula_ip,
+        groups=['test-vm'],
         firewall=nebula.Firewall(
             inbound=[nebula.FirewallRule('any', 'any')],
             outbound=[nebula.FirewallRule('any', 'any')]
