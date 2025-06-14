@@ -210,7 +210,7 @@ server=1.1.1.1
 '''
     spec = Container(
         name='dns',
-        image='ghcr.io/bensku/pigeon/dnsmasq', # TODO migrate image to this repo and pin tag
+        image='ghcr.io/bensku/containerops-builds/dnsmasq:latest',
         volumes=[(ConfigFile(id=f'{pod_name}-dns-config', data=config), '/etc/dnsmasq.conf')],
         present=present
     )

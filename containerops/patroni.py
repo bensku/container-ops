@@ -33,7 +33,7 @@ class ClusterConfig:
 @operation()
 def instance(cluster: ClusterConfig, hostname: str,
              superuser_secret: str, replication_secret: str, rewind_secret: str,
-             image: str = 'ghcr.io/bensku/pigeon/patroni',
+             image: str = 'ghcr.io/bensku/containerops-builds/patroni:4.0.6-postgres17',
              present: bool = True):
     """
     Creates a Patroni-managed PostgreSQL instance in a container.
