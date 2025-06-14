@@ -20,6 +20,10 @@ class ClusterConfig:
     cluster_id: str
     members: list[str]
 
+    @property
+    def endpoints(self):
+        return [f'{member}:2379' for member in self.members]
+
 
 @operation()
 def node(cluster: ClusterConfig, hostname: str,
@@ -54,7 +58,7 @@ def node(cluster: ClusterConfig, hostname: str,
         network=network,
         hostname=hostname,
         firewall=_firewall(internal_group, client_groups),
-        groups=[internal_group] if internal_group else [],
+        groups=[internal_group, 'etcd'],
     )
 
     initial_cluster = ','.join([f'{member}=http://{member}:2380' for member in cluster.members])

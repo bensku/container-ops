@@ -20,7 +20,7 @@ def etcd_cluster():
         cluster=CLUSTER_CONFIG,
         hostname=f'{host.name}.etcd.containerops.test',
         network=net_config,
-        client_groups=['test-vm'],
+        client_groups=['test-vm', 'patroni-test'],
     )
 
 
