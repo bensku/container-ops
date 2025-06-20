@@ -18,6 +18,7 @@ NEBULA_HASH = 'af57ded8f3370f0486bb24011942924b361d77fa34e3478995b196a5441dbf71'
 NEBULA_NETNS_DOWNLOAD = 'https://github.com/bensku/nebula-netns/releases/download/v1.9.5-netns0/nebula-netns-linux-amd64'
 CONTAINER_NEBULA_DOWNLOAD = 'https://github.com/bensku/nebula-netns/releases/download/v1.9.5-netns0/container-nebula.sh'
 
+FAILOVERD_DOWNLOAD = 'https://github.com/bensku/failoverd/releases/download/v0.0.1/failoverd-amd64'
 
 @dataclass
 class Network:
@@ -38,6 +39,9 @@ class Network:
         underlay_port_range: Port range to use for encrypted UDP traffic of
             endpoints. Each endpoint may explicitly specify its own port,
             overriding this.
+        failover_etcd: List of etcd endpoints for failover IPs. They must be
+            reachable (and DNS resolveble!) from hosts that contain failover
+            Nebula endpoints!
     """
 
     name: str
@@ -47,6 +51,7 @@ class Network:
     lighthouses: list[tuple[str, str]] = field(repr=False)
 
     underlay_port_range: tuple[int, int] = field(default=(12500, 13000), repr=False)
+    failover_etcd: list[str] = field(default_factory=list, repr=False)
 
     def state(self):
         return f'{self.name}-{self.epoch}'
@@ -88,7 +93,7 @@ def ca(network: Network, duration: str = '876000h'):
             be more secure.
     """
 
-    yield from _ensure_installed(install_tools=True)
+    yield from _ensure_installed(install_tools=True, failover_support=False)
     cert_dir = f'/etc/containerops/nebula/networks/{network.name}/ca/{network.epoch}'
     yield StringCommand(f'mkdir -p "{cert_dir}"')
     yield StringCommand(
@@ -110,8 +115,6 @@ def certificate(network: Network, hostname: str, ip: str, groups: list[str] = []
     The created certificates can be found at
     /etc/containerops/nebula/networks/<network name>/endpoint/<hostname>.
     """
-
-    yield from _ensure_installed(install_tools=False)
     # Generate the certificate locally
     ca_dir = f'/etc/containerops/nebula/networks/{network.name}/ca/{network.epoch}'
     cert_dir = f'/etc/containerops/nebula/networks/{network.name}/endpoint/{hostname}'
@@ -169,6 +172,7 @@ def endpoint(
         create_cert: bool = True,
         is_lighthouse: bool = False,
         underlay_port: int = None,
+        failover: bool = False,
         pod: str = None,
         present: bool = True
     ):
@@ -196,6 +200,12 @@ def endpoint(
             Finally, if set to a non-zero number, that port will be used and
             must be available. For lighthouses, a non-zero ports must be
             explicitly set and they must match their port in network configuration!
+        failover: Enable failover for this endpoint. In failover mode,
+            endpoints on different machines can share the same hostname, and
+            etcd is used to make sure only one of them is active at a time.
+            When the currently active endpoint goes down for any reason,
+            another one will automatically take its place within a few dozen
+            seconds.
         pod: If set, this endpoint will be created within a Podman pod.
             If the pod has been deployed with container-ops, use
             nebula.pod_endpoint() instead to get functional DNS for free!
@@ -204,6 +214,9 @@ def endpoint(
     """
     if not hostname.endswith(network.dns_domain):
         raise ValueError(f'hostname {hostname} does not belong to network DNS domain {network.dns_domain}')
+    if failover and len(network.failover_etcd) == 0:
+        raise ValueError('failover_key set, but network does not support failover')
+    yield from _ensure_installed(install_tools=False, failover_support=failover)
 
     # Make sure that we have IP and (even if statically set) it is unique
     ip = ipam.allocate_ip(
@@ -229,6 +242,9 @@ def endpoint(
         yield StringCommand(f'rm -rf /etc/containerops/nebula/networks/{network.name}/endpoint/{hostname}')
         yield StringCommand(f'rm -f /etc/systemd/system/nebula-{hostname}.service')
         yield from systemd.service._inner(service=f'nebula-{hostname}.service', enabled=False, running=False, daemon_reload=True)
+        if failover:
+            yield StringCommand(f'rm -f /etc/systemd/system/nebula-{hostname}-failover.service')
+            yield from systemd.service._inner(service=f'nebula-{hostname}-failover.service', enabled=False, running=False, daemon_reload=True)
         return
 
     if is_lighthouse:
@@ -242,7 +258,7 @@ def endpoint(
     config_path = f'/etc/containerops/nebula/networks/{network.name}/endpoint/{hostname}/config.json'
     config_changed = host.get_fact(Sha1File, path=config_path) != files.get_file_sha1(config)
     
-    unit_file = StringIO(_nebula_unit(network, hostname, config_path, pod))
+    unit_file = StringIO(_nebula_unit(network, hostname, config_path, pod, failover))
     unit_path = f'/etc/systemd/system/nebula-{hostname}.service'
     unit_changed = host.get_fact(Sha1File, path=unit_path) != files.get_file_sha1(unit_file)
 
@@ -252,12 +268,23 @@ def endpoint(
 
     # If unit file changed, upload new version and restart service
     # This will also take change of reloading Nebula config
+    running = not failover # If failover is enabled, it starts/stops the service as needed
     if unit_changed:
         yield FileUploadCommand(src=unit_file, dest=unit_path, remote_temp_filename=host.get_temp_filename(unit_path))
-        yield from systemd.service._inner(service=f'nebula-{hostname}', enabled=True, running=True, restarted=True, daemon_reload=True)
+        yield from systemd.service._inner(service=f'nebula-{hostname}', enabled=running, running=running, restarted=True, daemon_reload=True)
     elif config_changed:
         # If only config changed, just reload (=send SIGHUP) the service
-        yield from systemd.service._inner(service=f'nebula-{hostname}', enabled=True, running=True, reloaded=True)
+        yield from systemd.service._inner(service=f'nebula-{hostname}', enabled=running, running=running, reloaded=True)
+
+    # If failover is enabled, deploy failoverd unit that launches Nebula on leader
+    if failover:
+        failoverd_unit = StringIO(_failoverd_unit(network, hostname, host.name, pod))
+        failoverd_unit_path = f'/etc/systemd/system/nebula-{hostname}-failover.service'
+        failoverd_unit_changed = host.get_fact(Sha1File, path=failoverd_unit_path) != files.get_file_sha1(failoverd_unit)
+        if failoverd_unit_changed:
+            yield FileUploadCommand(src=failoverd_unit, dest=failoverd_unit_path, remote_temp_filename=host.get_temp_filename(failoverd_unit_path))
+            yield from systemd.service._inner(service=f'nebula-{hostname}-failover.service', enabled=True, running=True, restarted=True, daemon_reload=True)
+
 
 
 def _nebula_config(network: Network, hostname: str, ip: str, is_lighthouse: bool, underlay_port: int, firewall: Firewall):
@@ -339,7 +366,7 @@ def _convert_fw_rule(rule: FirewallRule):
         } for group in groups]
 
 
-def _nebula_unit(network: Network, hostname: str, config_path: str, target_pod: str = None):
+def _nebula_unit(network: Network, hostname: str, config_path: str, target_pod: str = None, failover: bool = False):
     config_path = f'/etc/containerops/nebula/networks/{network.name}/endpoint/{hostname}/config.json'
     return f'''
 [Unit]
@@ -347,6 +374,7 @@ Description=Nebula overlay - {hostname} ({network.name})
 Wants=network-online.target
 After=network-online.target
 {f'Requires={target_pod}-pod.service\nAfter={target_pod}-pod.service' if target_pod else ''}
+{f'Requires=nebula-{hostname}-failover.service' if failover else ''}
 
 [Service]
 ExecStartPre=/opt/containerops/nebula/nebula-netns -test -config {config_path}
@@ -380,12 +408,42 @@ WantedBy=multi-user.target
 '''
 
 
-def _pod_handler(network: Network, hostname: str, ip: str, groups: list[str], firewall: Firewall,
+def _failoverd_unit(network: Network, hostname: str, failover_key: str, target_pod: str = None):
+    return f'''
+[Unit]
+Description=Nebula overlay failoverd - {hostname} ({network.name})
+Wants=network-online.target
+After=network-online.target
+{f'Requires={target_pod}-pod.service\nAfter={target_pod}-pod.service' if target_pod else ''}
+
+[Service]
+ExecStart=/opt/containerops/failoverd \\
+    -etcd-endpoints {','.join(network.failover_etcd)} -session-ttl 10 \\
+    -election-prefix /failoverd/nebula/{network.name}/{hostname} -node-id {failover_key} \\
+    -start-command "/bin/systemctl start nebula-{hostname}" -startup-delay 10s \\
+    -stop-command "/bin/systemctl stop nebula-{hostname}"
+
+User=root
+Group=root
+
+Restart=always
+RestartSec=2
+TimeoutStopSec=5
+StartLimitInterval=0
+
+Nice=-1
+
+[Install]
+WantedBy=multi-user.target
+'''
+
+
+def _pod_handler(network: Network, hostname: str, ip: str, groups: list[str], firewall: Firewall, failover: bool,
                  pod: str, present: bool):
-    yield from endpoint._inner(network, hostname=hostname, ip=ip, groups=groups, firewall=firewall, pod=pod, present=present)
+    yield from endpoint._inner(network, hostname=hostname, ip=ip, groups=groups, firewall=firewall, failover=failover, pod=pod, present=present)
 
 
-def pod_endpoint(network: Network, hostname: str, firewall: Firewall, ip: str = None, groups: list[str] = []):
+def pod_endpoint(network: Network, hostname: str, firewall: Firewall, ip: str = None, groups: list[str] = [], failover: bool = False):
     """
     Create an endpoint that can be used to attach a pod to a Nebula network.
 
@@ -402,17 +460,23 @@ def pod_endpoint(network: Network, hostname: str, firewall: Firewall, ip: str = 
             if present. When not given, a random address is assigned with IPAM.
         groups: Groups of the endpoint. Other endpoints can refer to them in
             their firewalls.
+        failover: Enable failover for this endpoint. In failover mode,
+            endpoints on different machines can share the same hostname, and
+            etcd is used to make sure only one of them is active at a time.
+            When the currently active endpoint goes down for any reason,
+            another one will automatically take its place within a few dozen
+            seconds.
     """
     return podman.Network(
         name=f'nebula:{hostname}',
         handler=_pod_handler,
-        args={'network': network, 'hostname': hostname, 'ip': ip, 'groups': groups, 'firewall': firewall},
+        args={'network': network, 'hostname': hostname, 'ip': ip, 'groups': groups, 'firewall': firewall, 'failover': failover},
         dns_domain=network.dns_domain,
         dns_servers=[lh[0] for lh in network.lighthouses]
     )
 
 
-def _ensure_installed(install_tools: bool):
+def _ensure_installed(install_tools: bool, failover_support: bool):
     yield from server.user._inner(user='nebula', system=True, create_home=False)
     yield StringCommand('mkdir -p /opt/containerops/nebula')
 
@@ -426,3 +490,9 @@ def _ensure_installed(install_tools: bool):
     yield from selinux.file_context._inner(path='/opt/containerops/nebula/nebula-netns', se_type='bin_t')
     yield from files.download._inner(src=CONTAINER_NEBULA_DOWNLOAD, dest='/opt/containerops/nebula/container-nebula.sh', mode='755')
     yield from selinux.file_context._inner(path='/opt/containerops/nebula/container-nebula.sh', se_type='bin_t')
+
+    # If failover is used, install failoverd
+    # TODO download from URL
+    if failover_support:
+        yield from files.download._inner(src=FAILOVERD_DOWNLOAD, dest='/opt/containerops/failoverd', mode='755')
+        yield from selinux.file_context._inner(path='/opt/containerops/failoverd', se_type='bin_t')

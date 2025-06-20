@@ -12,5 +12,10 @@ net_config = nebula.Network(
     lighthouses=[
         ('10.2.57.1', f'{ip_addresses['containerops-1']}:4242'),
         ('10.2.57.3', f'{ip_addresses['containerops-3']}:4242'),
+    ],
+    failover_etcd=[
+        'containerops-1.etcd.containerops.test:2379',
+        'containerops-2.etcd.containerops.test:2379',
+        'containerops-3.etcd.containerops.test:2379',
     ]
 )
