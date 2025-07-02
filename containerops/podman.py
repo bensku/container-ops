@@ -129,7 +129,8 @@ def custom_dns(domain: str, servers: list[str]) -> Network:
 
 
 @operation()
-def pod(pod_name: str, containers: list[Container], networks: list[Network], ports: list[tuple[str, str, str]] = [], present: bool = True):
+def pod(pod_name: str, containers: list[Container], networks: list[Network], ports: list[tuple[str, str, str]] = [], present: bool = True,
+        _expose_dns: bool = False):
     """
     Deploy a Podman pod.
 
@@ -147,7 +148,7 @@ def pod(pod_name: str, containers: list[Container], networks: list[Network], por
     if not present:
         # Remove ALL containers
         yield from _remove_missing_containers(containers=[], pod_name=pod_name)
-        yield from _pod_dns(pod_name=pod_name, networks=[], present=False)
+        yield from _pod_dns(pod_name=pod_name, networks=[], all_networks=False, present=False)
 
         # Remove container-ops external networks
         for net in networks:
@@ -193,7 +194,7 @@ WantedBy=multi-user.target default.target
     yield from _install_service(unit_name=f'{pod_name}.pod', service_name=f'{pod_name}-pod', unit=pod_unit, present=True)
 
     # Deploy DNS container for multi-network support
-    yield from _pod_dns(pod_name=pod_name, networks=networks, present=True)
+    yield from _pod_dns(pod_name=pod_name, networks=networks, all_networks=_expose_dns, present=True)
 
     # Remove containers that are no longer present
     yield from _remove_missing_containers(containers=containers, pod_name=pod_name)
@@ -208,11 +209,17 @@ WantedBy=multi-user.target default.target
             yield from net.handler(**net.args, pod=pod_name, present=True)
 
 
-def _pod_dns(pod_name: str, networks: list[Network], present: bool):
-    config = f'''# Provide DNS to this pod only
+def _pod_dns(pod_name: str, networks: list[Network], all_networks: bool, present: bool):
+    if all_networks:
+        serve_config = '''# Provide DNS to all networks
+bind-interfaces
+'''
+    else:
+        serve_config = '''# Provide DNS to this pod only
 bind-interfaces
 interface=lo
-no-dhcp-interface=lo
+no-dhcp-interface=lo'''
+    config = f'''{serve_config}
 
 # DNS servers for pod networks
 {'\n'.join([f'server=/{net.dns_domain}/{server}' for net in networks for server in net.dns_servers])}

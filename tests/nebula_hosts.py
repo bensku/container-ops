@@ -2,7 +2,7 @@ from pyinfra import host
 from pyinfra.api import deploy
 from pyinfra.operations import server
 
-from containerops import nebula
+from containerops import hostdns, nebula, podman
 from tests.nebula_common import net_config
 
 @deploy('Nebula management network')
@@ -20,8 +20,15 @@ def management_net():
         underlay_port=4242,
         present=True
     )
-    # FIXME terrible hack
-    server.shell(f'echo "options rotate\nnameserver 10.2.57.1\nnameserver 8.8.8.8" >/etc/resolv.conf')
+    endpoint = nebula.pod_endpoint(
+        network=net_config,
+        hostname=f'{host.name}.hostdns.containerops.test',
+        firewall=nebula.Firewall(
+            inbound=[],
+            outbound=[]
+        ),
+    )
+    hostdns.install(networks=[endpoint, podman.HOST_NAT], present=True)
 
 
 management_net()
