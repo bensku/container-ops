@@ -24,7 +24,7 @@ def node(pod_name: str, hostname: str,
          rdb_config: str = '', use_aof: bool = True,
          sentinel_config: SentinelConfig = None,
          custom_config: str = '',
-         image: str = 'docker.io/valkey/valkey:8.1-alpine3.21',
+         image: str = 'ghcr.io/valkey-io/valkey:8.1-alpine3.21',
          present: bool = True):
     """
     Creates a containerized Valkey node that is reachable over Nebula overlay.

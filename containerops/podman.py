@@ -113,6 +113,21 @@ class ConfigFile:
 HOST_NAT = Network(name='host-nat', handler='podman_host_nat', args={}, dns_domain='', dns_servers=[])
 
 
+def custom_dns(domain: str, servers: list[str]) -> Network:
+    """
+    Creates a pseudo-network that only adds DNS servers to the pods it is
+    attached to.
+
+    This may be useful if you want split DNS while still running actual data
+    through one network.
+
+    Arguments:
+        domain: DNS domain that the given servers should be used for.
+        servers: List of DNS servers to add to the network.
+    """
+    return Network(name='custom-dns', handler='custom_dns', args={}, dns_domain=domain, dns_servers=servers)
+
+
 @operation()
 def pod(pod_name: str, containers: list[Container], networks: list[Network], ports: list[tuple[str, str, str]] = [], present: bool = True):
     """
@@ -136,7 +151,7 @@ def pod(pod_name: str, containers: list[Container], networks: list[Network], por
 
         # Remove container-ops external networks
         for net in networks:
-            if net.handler != 'podman_host_nat':
+            if net.handler != 'podman_host_nat' and net.handler != 'custom_dns':
                 yield from net.handler(**net.args, pod=pod_name, present=False)
 
         # Remove pod, then finally its network
@@ -189,7 +204,7 @@ WantedBy=multi-user.target default.target
 
     # Deploy non-NAT networks
     for net in networks:
-        if net.handler != 'podman_host_nat':
+        if net.handler != 'podman_host_nat' and net.handler != 'custom_dns':
             yield from net.handler(**net.args, pod=pod_name, present=True)
 
 

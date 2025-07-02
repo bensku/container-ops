@@ -87,7 +87,7 @@ def install(svc_name: str, zones: list[Zone], present: bool = True,
 
 log:
   - target: stdout
-    any: info
+    any: debug
 """
     
     # Create keys for zones that allow dynamic updates
@@ -104,10 +104,8 @@ log:
         if zone.acme_config:
             main_config += f"""  - id: {zone.domain}-acme-acl
     address: [{','.join(zone.acme_config.allowed_ip_ranges)}]
+    key: {zone.domain}-acme-key
     action: update
-    update-owner: name
-    update-owner-match: equal
-    update-owner-name: [_acme_challenge]
     update-type: [TXT]
 """
     

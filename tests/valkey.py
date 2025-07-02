@@ -27,7 +27,7 @@ def sentinel_cluster():
         pod_name='valkey-sentinel',
         hostname=f'sentinel-{host.name}.valkey.containerops.test',
         network=net_config,
-        client_groups=['test-vm'],
+        client_groups=['test-vm', 'caddy'],
         sentinel_config=SENTINEL_CONFIG
     )
 
