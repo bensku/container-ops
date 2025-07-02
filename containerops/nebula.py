@@ -16,9 +16,12 @@ NEBULA_HASH = 'af57ded8f3370f0486bb24011942924b361d77fa34e3478995b196a5441dbf71'
 
 # TODO arm64 support
 NEBULA_NETNS_DOWNLOAD = 'https://github.com/bensku/nebula-netns/releases/download/v1.9.5-netns0/nebula-netns-linux-amd64'
+NEBULA_NETNS_HASH = 'bdd56dfce37cc550fe0cc00c7b0232310c2ddd0d72b1f35c992b46f456f40d91'
 CONTAINER_NEBULA_DOWNLOAD = 'https://github.com/bensku/nebula-netns/releases/download/v1.9.5-netns0/container-nebula.sh'
+CONTAINER_NEBULA_HASH = 'd1b4f29ec04c98f58acf3c9148cfacefd65e856e36379b4ca77c01d330c94084'
 
 FAILOVERD_DOWNLOAD = 'https://github.com/bensku/failoverd/releases/download/v0.0.1/failoverd-amd64'
+FAILOVERD_HASH = '1c46cddcfa005a39897884bd63885d36668f683667fd7daf6aa41e545b70536d'
 
 @dataclass
 class Network:
@@ -93,7 +96,7 @@ def ca(network: Network, duration: str = '876000h'):
             be more secure.
     """
 
-    yield from _ensure_installed(install_tools=True, failover_support=False)
+    yield from setup_host._inner(install_tools=True, failover_support=False)
     cert_dir = f'/etc/containerops/nebula/networks/{network.name}/ca/{network.epoch}'
     yield StringCommand(f'mkdir -p "{cert_dir}"')
     yield StringCommand(
@@ -179,6 +182,9 @@ def endpoint(
     """
     Create an endpoint to attach the current host to a Nebula network.
 
+    This does not install Nebula binaries, so the host must have
+    nebula.host_setup() done before!
+
     Arguments:
         network: Network configuration.
         hostname: Hostname of the endpoint.
@@ -216,7 +222,6 @@ def endpoint(
         raise ValueError(f'hostname {hostname} does not belong to network DNS domain {network.dns_domain}')
     if failover and len(network.failover_etcd) == 0:
         raise ValueError('failover_key set, but network does not support failover')
-    yield from _ensure_installed(install_tools=False, failover_support=failover)
 
     # Make sure that we have IP and (even if statically set) it is unique
     ip = ipam.allocate_ip(
@@ -451,6 +456,8 @@ def pod_endpoint(network: Network, hostname: str, firewall: Firewall, ip: str = 
     network according to the given firewall rules. Pod DNS is also configured
     to resolve names under network's DNS domain to other endpoints.
 
+    Note that host the pod runs on must have nebula.host_setup() done!
+
     Arguments:
         network: Network configuration.
         hostname: Hostname of the endpoint.
@@ -476,9 +483,22 @@ def pod_endpoint(network: Network, hostname: str, firewall: Firewall, ip: str = 
     )
 
 
-def _ensure_installed(install_tools: bool, failover_support: bool):
+@operation()
+def setup_host(install_tools: bool = False, failover_support: bool = True):
+    """
+    Installs Nebula on current host, allowing it and pods running it to have
+    endpoints.
+
+    Arguments:
+        install_tools: Install Nebula tools, e.g. nebula-cert. Not needed for
+            endpoints themself, defaults to False.
+        failover_support: Enable failover endpoint support for this host.
+            Defaults to True, but can be safely disabled if you do not
+            intend to use Nebula failover.
+    """
+
     yield from server.user._inner(user='nebula', system=True, create_home=False)
-    yield StringCommand('mkdir -p /opt/containerops/nebula')
+    yield from files.directory._inner(path='/opt/containerops/nebula')
 
     # If desired, install vanilla Nebula for nebula-cert
     if install_tools and host.get_fact(Sha256File, path='/opt/containerops/nebula.tar.gz') != NEBULA_HASH:
@@ -486,13 +506,12 @@ def _ensure_installed(install_tools: bool, failover_support: bool):
         yield StringCommand('tar xzf /opt/containerops/nebula.tar.gz -C /opt/containerops/nebula')
 
     # Install nebula-netns for container networking support
-    yield from files.download._inner(src=NEBULA_NETNS_DOWNLOAD, dest='/opt/containerops/nebula/nebula-netns', mode='755')
+    yield from files.download._inner(src=NEBULA_NETNS_DOWNLOAD, sha256sum=NEBULA_NETNS_HASH, dest='/opt/containerops/nebula/nebula-netns', mode='755')
     yield from selinux.file_context._inner(path='/opt/containerops/nebula/nebula-netns', se_type='bin_t')
-    yield from files.download._inner(src=CONTAINER_NEBULA_DOWNLOAD, dest='/opt/containerops/nebula/container-nebula.sh', mode='755')
+    yield from files.download._inner(src=CONTAINER_NEBULA_DOWNLOAD, sha256sum=CONTAINER_NEBULA_HASH, dest='/opt/containerops/nebula/container-nebula.sh', mode='755')
     yield from selinux.file_context._inner(path='/opt/containerops/nebula/container-nebula.sh', se_type='bin_t')
 
     # If failover is used, install failoverd
-    # TODO download from URL
     if failover_support:
-        yield from files.download._inner(src=FAILOVERD_DOWNLOAD, dest='/opt/containerops/failoverd', mode='755')
+        yield from files.download._inner(src=FAILOVERD_DOWNLOAD, sha256sum=FAILOVERD_HASH, dest='/opt/containerops/failoverd', mode='755')
         yield from selinux.file_context._inner(path='/opt/containerops/failoverd', se_type='bin_t')

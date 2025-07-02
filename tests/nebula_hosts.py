@@ -7,6 +7,7 @@ from tests.nebula_common import net_config
 
 @deploy('Nebula management network')
 def management_net():
+    nebula.setup_host()
     nebula.endpoint(
         network=net_config, 
         hostname=f'{host.name}.containerops.test',
