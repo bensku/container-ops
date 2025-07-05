@@ -83,6 +83,7 @@ class Network:
 
     dns_domain: str
     dns_servers: list[str] = field(default_factory=list)
+    systemd_services: list[str] = field(default_factory=list)
 
     def __repr__(self):
         return f'Network({self.name})'
@@ -199,14 +200,17 @@ WantedBy=multi-user.target default.target
     # Remove containers that are no longer present
     yield from _remove_missing_containers(containers=containers, pod_name=pod_name)
 
-    # Deploy this pod's containers
-    for spec in containers:
-        yield from container._inner(spec=spec, pod_name=pod_name)
+    # Figure out if networks create services that our containers need to depend on
+    net_svcs = [svc for net in networks for svc in net.systemd_services]
 
     # Deploy non-NAT networks
     for net in networks:
         if net.handler != 'podman_host_nat' and net.handler != 'custom_dns':
             yield from net.handler(**net.args, pod=pod_name, present=True)
+
+    # Deploy this pod's containers
+    for spec in containers:
+        yield from container._inner(spec=spec, pod_name=pod_name, required_svcs=net_svcs)
 
 
 def _pod_dns(pod_name: str, networks: list[Network], all_networks: bool, present: bool):
@@ -252,7 +256,7 @@ def _remove_missing_containers(containers: list[Container], pod_name: str):
 
 
 @operation()
-def container(spec: Container, pod_name: str = None):
+def container(spec: Container, pod_name: str = None, required_svcs: list[str] = []):
     pod_prefix = f'{pod_name}-' if pod_name else ''
     service_name = f'{pod_prefix}{spec.name}'
 
@@ -284,6 +288,7 @@ def container(spec: Container, pod_name: str = None):
     unit = f"""[Unit]
 Description={f'{pod_name} - {spec.name}' if pod_name else spec.name}
 {'\n'.join([f'Requires={pod_prefix}{c}.service\nAfter={pod_prefix}{c}.service' for c in spec.dependencies])}
+{'\n'.join([f'Requires={svc}.service\nAfter={svc}.service' for svc in required_svcs])}
 
 [Container]
 ContainerName={service_name}

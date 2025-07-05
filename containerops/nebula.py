@@ -479,7 +479,8 @@ def pod_endpoint(network: Network, hostname: str, firewall: Firewall, ip: str = 
         handler=_pod_handler,
         args={'network': network, 'hostname': hostname, 'ip': ip, 'groups': groups, 'firewall': firewall, 'failover': failover},
         dns_domain=network.dns_domain,
-        dns_servers=[lh[0] for lh in network.lighthouses]
+        dns_servers=[lh[0] for lh in network.lighthouses],
+        systemd_services=[f'nebula-{hostname}']
     )
 
 
