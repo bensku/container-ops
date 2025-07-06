@@ -7,24 +7,27 @@ from tests.nebula_common import net_config
 
 
 @deploy('Install Knot for DNS-01')
-def setup_dns():
+def setup_dns(primary: bool):
     zone = knot.Zone(
         domain='acme.test',
         records=[
-            knot.Record('@', 'SOA', 'dns.containerops.test. nowhere.containerops.test. (0 4H 1H 12W 1D)'),
-            knot.Record('@', 'NS', 'dns.containerops.test.'),
+            knot.Record('@', 'SOA', 'ns1.containerops.test. nowhere.containerops.test. (0 4H 1H 12W 1D)'),
+            knot.Record('@', 'NS', 'ns1.containerops.test.'),
+            knot.Record('@', 'NS', 'ns2.containerops.test.'),
             knot.Record('caddy', 'A', '10.2.57.42',),
         ],
         acme_config=knot.AcmeConfig(
             allowed_ip_ranges=['10.2.57.0/24'],
             tsig_key='mxDDXc1wX33ZDR0vNkGsH3nU8W7MW4g38+5TNpGtQDU=',
         ),
+        transfer_from=knot.Remote(name='primary', address='10.2.57.43@5300') if not primary else None,
+        transfer_to=[knot.Remote(name='secondary', address='10.2.57.44@5300')] if primary else [],
     )
 
     endpoint = nebula.pod_endpoint(
         network=net_config,
-        hostname=f'dns.containerops.test',
-        ip='10.2.57.43',
+        hostname='ns1.containerops.test' if primary else 'ns2.containerops.test',
+        ip='10.2.57.43' if primary else '10.2.57.44',
         firewall=nebula.Firewall(
             inbound=[nebula.FirewallRule('any', 'any')],
             outbound=[nebula.FirewallRule('any', 'any')]
@@ -130,7 +133,7 @@ cFu/kYoPrA6NvtIrSlx4DPLf2DQM+wpB3H1BfWx7FkA6xfZlO6QRHidgCJg=
             podman.Container(
                 name='main',
                 image='ghcr.io/letsencrypt/pebble:latest',
-                command='-dnsserver 10.2.57.43:5300',
+                command='-dnsserver 10.2.57.44:5300',
                 volumes=[
                     (podman.ConfigFile(id='pebble-cert', data=tls_crt), '/test/certs/localhost/cert.pem'),
                     (podman.ConfigFile(id='pebble-key', data=tls_key), '/test/certs/localhost/key.pem')
@@ -158,7 +161,7 @@ def setup_caddy():
 *.acme.test {{
     tls {{
         dns rfc2136 {{
-            server "dns.containerops.test:5300"
+            server "ns1.containerops.test:5300"
             key_alg "hmac-sha256"
             key_name "acme.test-acme-key"
             key "mxDDXc1wX33ZDR0vNkGsH3nU8W7MW4g38+5TNpGtQDU="
@@ -207,10 +210,12 @@ p9BI7gVKtWSZYegicA==
                     (podman.ConfigFile(id='pebble-ca', data=pebble_ca), '/etc/caddy/pebble-ca.pem')
                 ]
             ),
-        ], networks=[endpoint, podman.custom_dns('acme.test', ['10.2.57.43#5300'])])
+        ], networks=[endpoint, podman.custom_dns('acme.test', ['10.2.57.44#5300'])])
 
 
 if host.name == 'containerops-1':
-    setup_dns()
     setup_pebble()
+    setup_dns(primary=True)
+if host.name == 'containerops-2':
+    setup_dns(primary=False)
 setup_caddy()

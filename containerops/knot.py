@@ -17,12 +17,18 @@ class Zone:
         acme_config: Configuration for ACME DNS-01 challenges via RFC 2136
             dynamic zone updates. Optional, if absent, no dynamic zone updates
             will be supported.
+        transfer_to: List of secondaries to transfer this zone to.
+        transfer_from: Primary that this zone on this server accepts zone
+            transfers from.
     """
     domain: str
     records: list['Record'] = field(repr=False)
 
     default_ttl: int = field(default=300)
     acme_config: 'AcmeConfig' = field(default=None)
+
+    transfer_to: list['Remote'] = field(default_factory=list)
+    transfer_from: 'Remote' = field(default=None)
 
 
 @dataclass(eq=True, frozen=True)
@@ -60,6 +66,22 @@ class AcmeConfig:
     tsig_key: str = field(repr=False)
 
 
+@dataclass
+class Remote:
+    """
+    Remote for DNS zone transfers.
+
+    Arguments:
+        name: Unique name of remote, used within Knot configuration.
+        address: Address of remote. If transfering between Knot instances,
+            note that they run on port 5300 in internal network. Remember
+            to specify this (e.g. '1.2.3.4@5300') and permit traffic in
+            endpoint firewalls!
+    """
+    name: str
+    address: str
+
+
 @operation()
 def install(svc_name: str, zones: list[Zone], present: bool = True,
             image: str = 'docker.io/cznic/knot:v3.4.6',
@@ -84,11 +106,25 @@ def install(svc_name: str, zones: list[Zone], present: bool = True,
     main_config = f"""server:
     listen: 0.0.0.0@5300
     listen: ::@5300
+    automatic-acl: on
 
 log:
   - target: stdout
     any: debug
 """
+    
+    # List remotes we'll refer to later
+    remotes = []
+    for zone in zones:
+        if zone.transfer_from:
+            remotes.append(zone.transfer_from)
+        else:
+            remotes += zone.transfer_to
+    main_config += 'remote:\n'
+    for remote in remotes:
+        main_config += f'''  - id: {remote.name}
+    address: {remote.address}
+'''
     
     # Create keys for zones that allow dynamic updates
     main_config += 'key:\n'
@@ -113,7 +149,11 @@ log:
     main_config += 'zone:\n'
     for zone in zones:
         main_config += f"""  - domain: {zone.domain}.
-    file: /config/{zone.domain}.zone{f'\n    acl: {zone.domain}-acme-acl' if zone.acme_config else ''}
+    zonefile-sync: -1
+    file: /config/{zone.domain}.zone
+    {f'acl: {zone.domain}-acme-acl' if zone.acme_config else ''}
+    {f'master: {zone.transfer_from.name}' if zone.transfer_from else ''}
+    {f'notify: [{','.join([remote.name for remote in zone.transfer_to])}]' if len(zone.transfer_to) > 0 else ''}
 """
 
     # Create volumes for main config file and the individual zone files
