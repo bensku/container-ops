@@ -484,7 +484,7 @@ def pod_endpoint(network: Network, hostname: str, firewall: Firewall, ip: str = 
 
 
 @operation()
-def setup_host(install_tools: bool = False, failover_support: bool = True, selinux: bool = False):
+def setup_host(install_tools: bool = False, failover_support: bool = True, selinux_label: bool = False):
     """
     Installs Nebula on current host, allowing it and pods running it to have
     endpoints.
@@ -495,7 +495,7 @@ def setup_host(install_tools: bool = False, failover_support: bool = True, selin
         failover_support: Enable failover endpoint support for this host.
             Defaults to True, but can be safely disabled if you do not
             intend to use Nebula failover.
-        selinux: Adjust Selinux labels of executable files automatically.
+        selinux_label: Adjust Selinux labels of executable files automatically.
             Defaults to False, enable if your host uses Selinux.
     """
 
@@ -509,14 +509,14 @@ def setup_host(install_tools: bool = False, failover_support: bool = True, selin
 
     # Install nebula-netns for container networking support
     yield from files.download._inner(src=NEBULA_NETNS_DOWNLOAD, sha256sum=NEBULA_NETNS_HASH, dest='/opt/containerops/nebula/nebula-netns', mode='755')
-    if selinux:
+    if selinux_label:
         yield from selinux.file_context._inner(path='/opt/containerops/nebula/nebula-netns', se_type='bin_t')
     yield from files.download._inner(src=CONTAINER_NEBULA_DOWNLOAD, sha256sum=CONTAINER_NEBULA_HASH, dest='/opt/containerops/nebula/container-nebula.sh', mode='755')
-    if selinux:
+    if selinux_label:
         yield from selinux.file_context._inner(path='/opt/containerops/nebula/container-nebula.sh', se_type='bin_t')
 
     # If failover is used, install failoverd
     if failover_support:
         yield from files.download._inner(src=FAILOVERD_DOWNLOAD, sha256sum=FAILOVERD_HASH, dest='/opt/containerops/failoverd', mode='755')
-        if selinux:
+        if selinux_label:
             yield from selinux.file_context._inner(path='/opt/containerops/failoverd', se_type='bin_t')
