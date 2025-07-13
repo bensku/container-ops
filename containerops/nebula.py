@@ -272,13 +272,13 @@ def endpoint(
 
     # If unit file changed, upload new version and restart service
     # This will also take change of reloading Nebula config
-    running = not failover # If failover is enabled, it starts/stops the service as needed
     if unit_changed:
         yield FileUploadCommand(src=unit_file, dest=unit_path, remote_temp_filename=host.get_temp_filename(unit_path))
-        yield from systemd.service._inner(service=f'nebula-{hostname}', enabled=running, running=running, restarted=True, daemon_reload=True)
-    elif config_changed:
+        if not failover: # If failover is enabled, it starts/stops the service as needed
+            yield from systemd.service._inner(service=f'nebula-{hostname}', enabled=True, running=True, restarted=True, daemon_reload=True)
+    elif config_changed and not failover:
         # If only config changed, just reload (=send SIGHUP) the service
-        yield from systemd.service._inner(service=f'nebula-{hostname}', enabled=running, running=running, reloaded=True)
+        yield from systemd.service._inner(service=f'nebula-{hostname}', enabled=True, running=True, reloaded=True)
 
     # If failover is enabled, deploy failoverd unit that launches Nebula on leader
     if failover:
@@ -287,6 +287,7 @@ def endpoint(
         failoverd_unit_changed = host.get_fact(Sha1File, path=failoverd_unit_path) != files.get_file_sha1(failoverd_unit)
         if failoverd_unit_changed:
             yield FileUploadCommand(src=failoverd_unit, dest=failoverd_unit_path, remote_temp_filename=host.get_temp_filename(failoverd_unit_path))
+        if failoverd_unit_changed or unit_changed or config_changed:
             yield from systemd.service._inner(service=f'nebula-{hostname}-failover.service', enabled=True, running=True, restarted=True, daemon_reload=True)
 
 
