@@ -480,7 +480,8 @@ def pod_endpoint(network: Network, hostname: str, firewall: Firewall, ip: str = 
         args={'network': network, 'hostname': hostname, 'ip': ip, 'groups': groups, 'firewall': firewall, 'failover': failover},
         dns_domain=network.dns_domain,
         dns_servers=[lh[0] for lh in network.lighthouses],
-        systemd_services=[f'nebula-{hostname}']
+        # If failover is enabled, make pod depend on it instead of forcefully starting the Nebula service itself
+        systemd_services=[f'nebula-{hostname}-failover' if failover else f'nebula-{hostname}']
     )
 
 
