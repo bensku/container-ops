@@ -54,6 +54,7 @@ class Container:
     # Advanced options
     linuxCapabilities: list[str] = field(default_factory=list)
     linuxDevices: list[str] = field(default_factory=list)
+    sysctls: list[tuple[str, str]] = field(default_factory=list)
 
     dependencies: list[str] = field(default_factory=list)
     present: bool = field(default=True)
@@ -303,6 +304,7 @@ Image={spec.image}
 
 {'\n'.join([f'AddCapability={c}' for c in spec.linuxCapabilities])}
 {'\n'.join([f'AddDevice={d}' for d in spec.linuxDevices])}
+{'\n'.join([f'Sysctl={ctl[0]}={ctl[1]}' for ctl in spec.sysctls])}
 
 [Service]
 Restart=always
