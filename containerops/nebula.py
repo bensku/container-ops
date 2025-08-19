@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from io import StringIO
 import json
 import os
@@ -31,6 +31,7 @@ class Network:
     
     Arguments:
         name: Name of the network.
+        state_dir: Local directory where network state should be stored.
         dns_domain: DNS domain of the network.
         cidr: Network range in CIDR format.
         epoch: Epoch. Initially, this should be set to 1. This can be increased
@@ -48,6 +49,7 @@ class Network:
     """
 
     name: str
+    state_dir: str
     dns_domain: str = field(repr=False)
     cidr: str
     epoch: int
@@ -77,35 +79,47 @@ class Firewall:
     outbound: list[FirewallRule]
 
 
+def initialize_network(network: Network):
+    # Serialize network configuration to see if it has changed
+    new_state = json.dumps(asdict(network), indent=4, sort_keys=True)
+    try:
+        with open(f'{network.state_dir}/networks/{network.name}/state.json', 'r') as f:
+            old_state = f.read()
+    except FileNotFoundError:
+        old_state = ''
+
+    if new_state != old_state:
+        # Check if we need to create CA certificate
+        try:
+            old_net = Network(**json.loads(old_state))
+            if old_net.epoch != network.epoch:
+                # TODO how to ensure host running this actually has nebula-cert installed?
+                _make_ca(network)
+        except (TypeError, json.JSONDecodeError):
+            _make_ca(network)
+
+        # Save new state
+        # Truncate the file before writing new state
+        with open(f'{network.state_dir}/networks/{network.name}/state.json', 'w') as f:
+            f.truncate(0)
+            f.write(new_state)
+
+
+def _make_ca(network: Network, duration: str = '876000h'):
+    cert_dir = f'{network.state_dir}/networks/{network.name}/ca/{network.epoch}'
+    os.makedirs(cert_dir, exist_ok=True)
+    subprocess.run([
+        '/opt/containerops/nebula/nebula-cert', 'ca',
+        '-name', f'{network.name} root, epoch {network.epoch}',
+        '-duration', duration,
+        '-out-crt', f'{cert_dir}/ca.crt',
+        '-out-key', f'{cert_dir}/ca.key',
+        '-out-qr', f'{cert_dir}/ca-qrcode.png'
+    ], check=True)
+
+
 @operation()
-def ca(network: Network, duration: str = '876000h'):
-    """
-    Create a Nebula certificate authority on the current host.
-
-    The CA key and certificate will be stored at
-    /opt/containerops/nebula/nebula-cert. If you used this operation on
-    a remote server, you should copy them to same location on your Pyinfra
-    host.
-
-    Arguments:
-        network: Network definition. This should be same that will be used for
-            creating certificates and endpoints. The lighthouses do not need to
-            actually exist yet.
-        duration: CA validity. Defaults to practically forever, but if you can
-            rotate certificates on all endpoints, setting this to lower would
-            be more secure.
-    """
-
-    cert_dir = f'/etc/containerops/nebula/networks/{network.name}/ca/{network.epoch}'
-    yield StringCommand(f'mkdir -p "{cert_dir}"')
-    yield StringCommand(
-        f'/opt/containerops/nebula/nebula-cert ca -name "{network.name} root, epoch {network.epoch}" -duration {duration}',
-        f'-out-crt "{cert_dir}/ca.crt" -out-key "{cert_dir}/ca.key"'
-    )
-
-
-@operation()
-def certificate(network: Network, hostname: str, ip: str, groups: list[str] = []):
+def certificate(network: Network, hostname: str, ip: str, groups: list[str] = [], deploy: bool = True):
     """
     Create a Nebula certificate for an endpoint. This is useful when you do not
     wish to use Pyinfra to configure the endpoint (e.g. mobile devices).
@@ -116,30 +130,63 @@ def certificate(network: Network, hostname: str, ip: str, groups: list[str] = []
 
     The created certificates can be found at
     /etc/containerops/nebula/networks/<network name>/endpoint/<hostname>.
+
+    Arguments:
+        network: Network definition.
+        hostname: Hostname of the endpoint. This should be unique within the
+            network, and must end with the network's DNS domain.
+        ip: IP address to put in certificate. Must be unique within network.
+        groups: Groups to put into certificate. Firewalls of network endpoints
+            can refer to these to permit traffic.
+        deploy: Whether to deploy the certificate on current target host.
+            Default to True; if disabled, the certificate will be available
+            only within network's local state directory.
     """
     # Generate the certificate locally
-    ca_dir = f'/etc/containerops/nebula/networks/{network.name}/ca/{network.epoch}'
-    cert_dir = f'/etc/containerops/nebula/networks/{network.name}/endpoint/{hostname}'
+    local_ca_dir = f'{network.state_dir}/networks/{network.name}/ca/{network.epoch}'
+    remote_ca_dir = f'/etc/containerops/nebula/networks/{network.name}/ca/{network.epoch}'
+    local_cert_dir = f'{network.state_dir}/networks/{network.name}/endpoint/{hostname}'
+    remote_cert_dir = f'/etc/containerops/nebula/networks/{network.name}/endpoint/{hostname}'
 
     # First, check if one might've already been created with same parameters
+    cert_needs_update, new_state, _ = _cert_needs_update(network, hostname, ip, groups)
+    if cert_needs_update:
+        # Create new certificate, possibly overwriting an old one
+        yield FunctionCommand(_new_cert, args=[hostname, ip, network.prefix_len, local_ca_dir, local_cert_dir, groups], func_kwargs={})
+        yield FunctionCommand(_update_state, args=[local_cert_dir, new_state], func_kwargs={})
+
+    # Deploy on server (if certificate or e.g. the target server changed)
+    if deploy:
+        yield from files.put._inner(src=f'{local_ca_dir}/ca.crt', dest=f'{remote_ca_dir}/ca.crt', group='nebula', mode='640')
+        yield from files.put._inner(src=f'{local_cert_dir}/host.crt', dest=f'{remote_cert_dir}/host.crt', group='nebula', mode='640')
+        yield from files.put._inner(src=f'{local_cert_dir}/host.key', dest=f'{remote_cert_dir}/host.key', group='nebula', mode='640')
+
+
+def _cert_needs_update(network: Network, hostname: str, ip: str, groups: list[str]) -> tuple[bool, str]:
+    local_cert_dir = f'{network.state_dir}/networks/{network.name}/endpoint/{hostname}'
+
     new_state = f'{network.state()} {hostname} {ip}/{network.prefix_len} {groups}'
     try:
-        with open(f'{cert_dir}/state.txt', 'r') as f:
+        with open(f'{local_cert_dir}/state.txt', 'r') as f:
             prev_state = f.read()
     except FileNotFoundError:
         prev_state = ''
-    if prev_state != new_state:
-        # Create new certificate, possibly overwriting an old one
-        yield FunctionCommand(_new_cert, args=[hostname, ip, network.prefix_len, ca_dir, cert_dir, groups], func_kwargs={})
-        yield FunctionCommand(_update_state, args=[cert_dir, new_state], func_kwargs={})
 
-    # Deploy on server (if certificate or e.g. the target server changed)
-    yield from files.put._inner(src=f'{ca_dir}/ca.crt', dest=f'{ca_dir}/ca.crt', group='nebula', mode='640')
-    yield from files.put._inner(src=f'{cert_dir}/host.crt', dest=f'{cert_dir}/host.crt', group='nebula', mode='640')
-    yield from files.put._inner(src=f'{cert_dir}/host.key', dest=f'{cert_dir}/host.key', group='nebula', mode='640')
+    updated = prev_state != new_state
+
+    # If update is needed, check whether or not it is reloadable (e.g. group change) or needs full service restart
+    reloadable_update = True
+    if updated:
+        prev_parts = prev_state.split(' ')
+        new_parts = new_state.split(' ')
+        # Hostname or IP changes are not reloadable
+        # TODO reloadability of epoch/network name changes?
+        reloadable_update = prev_parts[1] == new_parts[1] and prev_parts[2] == new_parts[2] if len(prev_parts) > 3 else False
+
+    return prev_state != new_state, new_state, reloadable_update
 
 
-def _new_cert(hostname: str, ip: str, prefix_len: int, ca_dir: str, cert_dir: str, groups: list[str]):
+def _new_cert(hostname: str, ip: str, prefix_len: int, ca_dir: str, cert_dir: str, groups: list[str], duration: str = None):
     # Make sure we have empty directory where to generate certificate
     os.makedirs(cert_dir, exist_ok=True)
     try:
@@ -156,11 +203,13 @@ def _new_cert(hostname: str, ip: str, prefix_len: int, ca_dir: str, cert_dir: st
         pass
 
     groups_opt = '-groups ' + ','.join(groups) if len(groups) > 0 else ''
-    subprocess.run(f'/opt/containerops/nebula/nebula-cert sign -name "{hostname}" -ip {ip}/{prefix_len} {groups_opt} -ca-crt "{ca_dir}/ca.crt" -ca-key "{ca_dir}/ca.key" -out-crt "{cert_dir}/host.crt" -out-key "{cert_dir}/host.key" -out-qr "{cert_dir}/host-qrcode.png"', check=True, shell=True)
+    duration_opt = f'-duration {duration}' if duration is not None else ''
+    subprocess.run(f'/opt/containerops/nebula/nebula-cert sign -name "{hostname}" -ip {ip}/{prefix_len} {groups_opt} {duration_opt} -ca-crt "{ca_dir}/ca.crt" -ca-key "{ca_dir}/ca.key" -out-crt "{cert_dir}/host.crt" -out-key "{cert_dir}/host.key" -out-qr "{cert_dir}/host-qrcode.png"', check=True, shell=True)
 
 
 def _update_state(cert_dir: str, state: str):
     with open(f'{cert_dir}/state.txt', 'w') as f:
+        f.truncate(0)
         f.write(state)
 
 
@@ -229,6 +278,7 @@ def endpoint(
         cidr=network.cidr,
         present=present,
         ip=ip,
+        base_dir=f'{network.state_dir}/networks',
     )
     # If no underlay port was given, allocate one dynamically
     # If port WAS given, assume that user knows what they're doing and do not validate anything
@@ -238,7 +288,8 @@ def endpoint(
             machine_id=host.name, # Name of the server we're deploying to
             hostname=hostname, # Endpoint hostname (lighthouse DNS name), has no relation to Pyinfra host.name
             port_range=network.underlay_port_range,
-            present=present
+            present=present,
+            base_dir=f'{network.state_dir}/networks',
         )
 
     if not present:
@@ -255,11 +306,20 @@ def endpoint(
         # Mark lighthouses, we'll permit DNS traffic towards them even if everything else is blocked
         groups += ['_lighthouse']
 
+    # Update certificate if needed; and we're going to do that, make sure Nebula picks it up immediately
+    cert_updated = False
     if create_cert:
+        cert_updated, _, cert_reloadable = _cert_needs_update(network, hostname, ip, groups)
         yield from certificate._inner(network, hostname, ip, groups)
 
-    config = StringIO(json.dumps(_nebula_config(network, hostname, ip, is_lighthouse, underlay_port, firewall), indent=4, sort_keys=True))
     config_path = f'/etc/containerops/nebula/networks/{network.name}/endpoint/{hostname}/config.json'
+
+    # Check if Nebula configuration has changed
+    ca_value = f'/etc/containerops/nebula/networks/{network.name}/ca/{network.epoch}/ca.crt'
+    cert_value = f'/etc/containerops/nebula/networks/{network.name}/endpoint/{hostname}/host.crt'
+    key_value = f'/etc/containerops/nebula/networks/{network.name}/endpoint/{hostname}/host.key'
+    config = StringIO(json.dumps(_nebula_config(network, hostname, ip, is_lighthouse, underlay_port, firewall,
+                                                ca_value, cert_value, key_value), indent=4, sort_keys=True))
     config_changed = host.get_fact(Sha1File, path=config_path) != files.get_file_sha1(config)
     
     unit_file = StringIO(_nebula_unit(network, hostname, config_path, pod, failover))
@@ -276,9 +336,13 @@ def endpoint(
         yield FileUploadCommand(src=unit_file, dest=unit_path, remote_temp_filename=host.get_temp_filename(unit_path))
         if not failover: # If failover is enabled, it starts/stops the service as needed
             yield from systemd.service._inner(service=f'nebula-{hostname}', enabled=True, running=True, restarted=True, daemon_reload=True)
-    elif config_changed and not failover:
-        # If only config changed, just reload (=send SIGHUP) the service
-        yield from systemd.service._inner(service=f'nebula-{hostname}', enabled=True, running=True, reloaded=True)
+    elif not failover:
+        if config_changed or (cert_updated and cert_reloadable):
+            # Certificate or config changed, just reload service (=SIGHUP)
+            yield from systemd.service._inner(service=f'nebula-{hostname}', enabled=True, running=True, reloaded=True)
+        elif cert_updated and not cert_reloadable:
+            # Certificate changed in a way that requires full service restart
+            yield from systemd.service._inner(service=f'nebula-{hostname}', enabled=True, running=True, restarted=True)
 
     # If failover is enabled, deploy failoverd unit that launches Nebula on leader
     if failover:
@@ -292,10 +356,8 @@ def endpoint(
 
 
 
-def _nebula_config(network: Network, hostname: str, ip: str, is_lighthouse: bool, underlay_port: int, firewall: Firewall):
-    ca_dir = f'/etc/containerops/nebula/networks/{network.name}/ca/{network.epoch}'
-    cert_dir = f'/etc/containerops/nebula/networks/{network.name}/endpoint/{hostname}'
-
+def _nebula_config(network: Network, hostname: str, ip: str, is_lighthouse: bool, underlay_port: int, firewall: Firewall,
+                   ca_value: str, cert_value: str, key_value: str) -> dict:
     # Make sure the firewall permits essential things like our internal DNS!
     firewall = _patch_firewall(firewall)
 
@@ -305,9 +367,9 @@ def _nebula_config(network: Network, hostname: str, ip: str, is_lighthouse: bool
     return {
         # Point to CA cert and host key material that should've been already uploaded
         'pki': {
-            'ca': f'{ca_dir}/ca.crt',
-            'cert': f'{cert_dir}/host.crt',
-            'key': f'{cert_dir}/host.key',
+            'ca': ca_value,
+            'cert': cert_value,
+            'key': key_value,
         },
         # Configure how to reach lighthouses, even if we are lighthouse
         'static_host_map': lighthouse_map,
@@ -372,7 +434,6 @@ def _convert_fw_rule(rule: FirewallRule):
 
 
 def _nebula_unit(network: Network, hostname: str, config_path: str, target_pod: str = None, failover: bool = False):
-    config_path = f'/etc/containerops/nebula/networks/{network.name}/endpoint/{hostname}/config.json'
     return f'''
 [Unit]
 Description=Nebula overlay - {hostname} ({network.name})
@@ -387,14 +448,6 @@ ExecStart={f'/opt/containerops/nebula/container-nebula.sh {target_pod}-infra' if
 ExecReload=/bin/kill -HUP $MAINPID
 Environment="NEBULA_NETNS_BINARY=/opt/containerops/nebula/nebula-netns"
 
-# RuntimeDirectory=nebula
-# ConfigurationDirectory=nebula
-# CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-# AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-# ProtectControlGroups=true
-# ProtectHome=true
-# ProtectKernelTunables=true
-# ProtectSystem=full
 User=root
 Group=root
 
