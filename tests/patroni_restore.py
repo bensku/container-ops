@@ -6,16 +6,16 @@ from tests.nebula_common import net_config
 
 
 CLUSTER_CONFIG = patroni.ClusterConfig(
-    cluster_id='test',
+    cluster_id='test2',
     members=[
-        'containerops-1.patroni.containerops.test',
-        'containerops-2.patroni.containerops.test',
+        'containerops-1.patroni2.containerops.test',
+        'containerops-2.patroni2.containerops.test',
     ],
     read_replicas=[
-        'containerops-3.patroni.containerops.test',
+        'containerops-3.patroni2.containerops.test',
     ],
     backup_replicas=[
-        'containerops-3.patroni.containerops.test',
+        'containerops-3.patroni2.containerops.test',
     ],
     client_groups=['test-vm'],
     network=net_config,
@@ -26,6 +26,7 @@ CLUSTER_CONFIG = patroni.ClusterConfig(
     ],
     etcd_client_group='patroni-test',
     barman_backup_support=True,
+    restore_from_backup=True
 )
 
 
@@ -36,7 +37,7 @@ def patroni_cluster():
     podman.secret('rewind-secret', source='tests/test_secret.json', json_key='pg_rewind')
     patroni.instance(
         cluster=CLUSTER_CONFIG,
-        hostname=f'{host.name}.patroni.containerops.test',
+        hostname=f'{host.name}.patroni2.containerops.test',
         superuser_secret='superuser-secret',
         replication_secret='replication-secret',
         rewind_secret='rewind-secret',
@@ -44,32 +45,8 @@ def patroni_cluster():
 
     patroni.proxy(
         cluster=CLUSTER_CONFIG,
-        hostname=f'{host.name}.pgproxy.containerops.test',
-    )
-
-
-@deploy('Barman backups')
-def barman_backups():
-    patroni.barman_backups(
-        sources=[
-            patroni.BackupSource(
-                cluster=CLUSTER_CONFIG,
-                pgproxy_hostname='containerops-1.pgproxy.containerops.test',
-                superuser_secret='superuser-secret',
-                replication_secret='replication-secret',
-            )
-        ],
-        hostname='barman.containerops.test',
-    )
-    # patroni.backup_now(CLUSTER_CONFIG)
-    # patroni.schedule_backups(CLUSTER_CONFIG)
-    patroni.restore_backup(
-        cluster=CLUSTER_CONFIG,
-        restore_name='test-restore',
-        target_time='Sat Aug 23 20:15:58 2025'
+        hostname=f'{host.name}.pgproxy2.containerops.test',
     )
 
 
 patroni_cluster()
-if host.name == 'containerops-1':
-    barman_backups()
