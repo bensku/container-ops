@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from io import StringIO
 import json
 from pyinfra.api import operation
 from pyinfra.operations import files, server
@@ -49,21 +50,19 @@ class ClusterConfig:
             backups. If you enable this, you MUST also deploy Barman and
             schedule it to run regularly. Otherwise, the PostgreSQL cluster will
             continue to accumulate old WAL files, eventually filling the disk.
-        restore_from_backup: Set this to True if you're creating this cluster
-            from an existing, physical backup. Restoring to an existing Patroni
-            cluster is not supported.
+        restore_from_backup: Absolute path of physical PostgreSQL backup to restore the
+            newly created cluster from. The backup must exist on at least one of
+            hosts that have members in the cluster.
             
             IMPORTANT NOTES
             - Restoring to an existing Patroni cluster is not supported.
-            - Remember: you MUST use a new cluster_id, even if old cluster is gone!
+            - Remember: Use a new cluster_id, unless you have manually cleared
+              the old one from etcd.
             - This is for restoring physical backups only (pg_basebackup, Barman, etc.)
               To restore a logical backup (pg_dump, pg_dumpall), create the cluster
               normally and then execute the dump's SQL against it.
             
-            BEFORE DEPLOYING:
-            1. Copy contents of backup to /var/containerops/data/patroni/<cluster_id>/incoming_restore
-            2. Chown the backup to postgres user inside Patroni container (be sure to use same image as this cluster will use):
-               podman run --rm -v /var/containerops/data/patroni/<cluster_id>/incoming_restore:/data:Z ghcr.io/bensku/containerops-builds/patroni:4.0.6-postgres17 chown -R postgres:postgres /data
+            Your backup will be automatically chowned to postgres user of Patroni image.
     """
     cluster_id: str
     members: list[str]
@@ -81,13 +80,14 @@ class ClusterConfig:
     postgres_config: PostgresConfig = field(default_factory=PostgresConfig)
 
     barman_backup_support: bool = field(default=False)
-    restore_from_backup: bool = field(default=False)
+    restore_from_backup: str = field(default=None)
 
 
 @operation()
 def instance(cluster: ClusterConfig, hostname: str,
              superuser_secret: str, replication_secret: str, rewind_secret: str,
              image: str = 'ghcr.io/bensku/containerops-builds/patroni:4.0.6-postgres17',
+             alias_patronictl: bool = True,
              present: bool = True):
     """
     Creates a Patroni-managed PostgreSQL instance in a container.
@@ -109,6 +109,8 @@ def instance(cluster: ClusterConfig, hostname: str,
         replication_secret: Name of the secret containing the replication password.
         rewind_secret: Name of the secret containing the rewind password.
         image: Container image for Patroni, if you want to override that.
+        alias_patronictl: By default, a script that calls patronictl inside the cluster's
+            container is created as /usr/local/bin/patronictl. Set this to False to disable.
         present: By default, the node is created or modified. If set to False,
             it is destroyed instead. Database data is NOT deleted from disk
             automatically.
@@ -142,18 +144,26 @@ def instance(cluster: ClusterConfig, hostname: str,
         readonly_replica=hostname in cluster.read_replicas,
         data_checksums=cluster.postgres_config.data_checksums,
         barman_support=cluster.barman_backup_support,
-        restore_backup=cluster.restore_from_backup
+        restore_backup=cluster.restore_from_backup is not None
     )
+    volumes = [
+        (f'/var/containerops/data/patroni/{cluster.cluster_id}', '/data:Z'),
+        (podman.ConfigFile(id=f'patroni-{cluster.cluster_id}-config', data=json.dumps(config, indent=2, sort_keys=True)), '/etc/patroni.yml')
+    ]
+    if cluster.restore_from_backup:
+        # If we're restoring from backup, mount the backup inside container
+        # The container's startup script will chown it to the postgres 
+        # Backup does not need to exist on all nodes, but make sure directory exists!
+        yield from files.directory._inner(path=cluster.restore_from_backup)
+        volumes.append((cluster.restore_from_backup, '/incoming_restore:Z'))
+
     yield from podman.pod._inner(
         pod_name=f'patroni-postgres-{cluster.cluster_id}',
         containers=[
             podman.Container(
                 name='main',
                 image=image,
-                volumes=[
-                    (f'/var/containerops/data/patroni/{cluster.cluster_id}', '/data:Z'),
-                    (podman.ConfigFile(id=f'patroni-{cluster.cluster_id}-config', data=json.dumps(config, indent=2, sort_keys=True)), '/etc/patroni.yml')
-                ],
+                volumes=volumes,
                 secrets=[
                     # Use environment variable configuration for secrets
                     ('PATRONI_SUPERUSER_PASSWORD', superuser_secret),
@@ -165,6 +175,18 @@ def instance(cluster: ClusterConfig, hostname: str,
         networks=[endpoint],
         present=present
     )
+
+    if alias_patronictl:
+        yield from files.put._inner(src=StringIO(PATRONICTL_SCRIPT), dest='/usr/local/bin/patronictl', mode='755')
+
+
+PATRONICTL_SCRIPT = """#!/bin/sh
+set -eu
+
+cluster_id=$1
+shift
+podman exec -it patroni-postgres-$cluster_id-main patronictl --config-file /etc/patroni.yml $@
+"""
 
 
 @operation()
@@ -250,14 +272,13 @@ def _patroni_config(cluster_id: str, hostname: str, etcd_addrs: list[str],
     if barman_support:
         slots['barman'] = { 'type': 'physical' }
 
-    # If we're bootstrapping a new cluster from (Barman) backup,
-    # try to copy local incoming_restore on each node
+    # If we're bootstrapping a new cluster from physical backup, try to copy local incoming_restore on each node
     # It will eventually succeed on the node it exists on
     bootstrap_method = 'restorebackup' if restore_backup else 'initdb'
     restore_config = None
     if bootstrap_method == 'restorebackup':
         restore_config = {
-            'command': 'cp -R /data/incoming_restore /data/postgres',
+            'command': 'cp -R /incoming_restore /data/postgres',
             'no_params': True,
             'keep_existing_recovery_conf': True
         }
@@ -374,11 +395,20 @@ class BackupSource:
             Preferably, you should deploy one in the machine where Barman will run.
         superuser_secret: Name of the Podman secret containing the superuser password.
         replication_secret: Name of the secret containing the replication password.
+        frequency: Automatic full backup frequency in cron format.
+        minimum_redundancy: Minimum number of backups to keep. This can avoid
+            accidental deletion of all backups. Defaults to 1.
+        recovery_window: Recovery window in days. Barman will keep backups this long
+            and then automatically delete them. Defaults to 30 days.
     """
     cluster: ClusterConfig
     pgproxy_hostname: str
     superuser_secret: str
     replication_secret: str
+
+    frequency: str = field(default='30 3 * * *') # Every day at 03:30
+    minimum_redundancy: int = field(default=1)
+    recovery_window: int = field(default=30)
 
 
 @operation()
@@ -386,10 +416,8 @@ def barman_backups(sources: list[BackupSource], hostname: str,
                    image: str = 'ghcr.io/bensku/containerops-builds/barman:latest',
                    present: bool = True):
     """
-    Sets up the current host as a Barman backup server for given source Patroni clusters.
-    This does NOT schedule or take backups; to do so, use:
-    - `backup_now()` to take an immediate backup
-    - `schedule_backups()` to schedule regular backups
+    Sets up Barman backup server on the current host, backing up one or more
+    Patroni clusters.
 
     TEST YOUR BACKUPS! container-ops can and will have bugs. It is not enough
     that Barman places some files on disk; how do you know Postgres can actually
@@ -407,7 +435,7 @@ def barman_backups(sources: list[BackupSource], hostname: str,
     secrets = []
     for source in sources:
         source_id = source.cluster.cluster_id
-        config = _barman_config(source_id, source.pgproxy_hostname)
+        config = _barman_config(source)
         config_mounts.append((podman.ConfigFile(id=f'barman-source-{source_id}', data=config), f'/etc/barman-sources/{source_id}.conf'))
 
         # Environment variables with
@@ -415,6 +443,9 @@ def barman_backups(sources: list[BackupSource], hostname: str,
             (f'REPLICATION_PASSWORD_{source_id}', source.replication_secret),
             (f'SUPERUSER_PASSWORD_{source_id}', source.superuser_secret)
         ]
+
+    crontab = _barman_crontab(sources)
+    config_mounts.append((podman.ConfigFile(id='barman-crontab', data=crontab), '/etc/cron.d/barman-backups'))
 
     endpoint = nebula.pod_endpoint(
         network=sources[0].cluster.network, # TODO what if clusters are in different networks?
@@ -457,29 +488,14 @@ def backup_now(cluster: ClusterConfig):
     Arguments:
         cluster: Cluster to back up.
     """
-    yield from server.shell._inner(f'podman exec barman-main barman cron && podman exec barman-main barman backup "{cluster.cluster_id}"')
+    yield from server.shell._inner(f'podman exec barman-main barman backup -q "{cluster.cluster_id}"')
 
 
 @operation()
-def schedule_backups(cluster: ClusterConfig, on_calendar: str = 'hourly'):
+def restore_backup(cluster_id: str, restore_name: str, backup_id: str = 'auto', target_time: str = None):
     """
-    Schedules regular backups with current host's Barman.
-    
-    Arguments:
-        cluster: Cluster to back up.
-        on_calendar: Systemd timer OnCalendar specification for how often to run.
-    """
-    yield from timer.schedule_command._inner(
-        timer_name=f'barman-backup-{cluster.cluster_id}',
-        on_calendar=on_calendar,
-        command=f'podman exec barman-main barman cron && podman exec barman-main barman backup "{cluster.cluster_id}"'
-    )
-
-
-@operation()
-def restore_backup(cluster: ClusterConfig, restore_name: str, backup_id: str = 'auto', target_time: str = None):
-    """
-    Restores a backup to `/var/barman_restored/<restore_name>` from current host's Barman.
+    Restores a backup to `/var/containerops/data/barman_restored/<restore_name>` from current host's Barman.
+    From there, you can copy it to wherever you want to restore it.
 
     To view a list of available backups, use:
     `podman exec barman-main barman list-backups <cluster_id>`
@@ -487,7 +503,7 @@ def restore_backup(cluster: ClusterConfig, restore_name: str, backup_id: str = '
     Arguments:
         cluster: Cluster to restore backup for.
         restore_name: Name for this restored backup. This affects only the storage
-            location, which is `/var/barman_restored/<restore_name>`.
+            location, which is `/var/containerops/data/barman_restored/<restore_name>`.
         backup_id: ID of the backup to restore. Defaults to `auto`, in which case
             Barman will automatically pick the backup based on target_time.
         target_time: If given, point-in-time recovery is done to this exact time,
@@ -495,16 +511,27 @@ def restore_backup(cluster: ClusterConfig, restore_name: str, backup_id: str = '
             The time must be in unambiguous format, such as what `list-backups` shows.
     """
     target_time_arg = f'--target-time "{target_time}"' if target_time else ''
-    yield from server.shell._inner(f'podman exec barman-main barman restore {cluster.cluster_id} {backup_id} /var/barman_restored/{restore_name} {target_time_arg}')
+    # Note: path inside container is different from path on host
+    yield from server.shell._inner(f'podman exec barman-main barman restore {cluster_id} {backup_id} /var/barman_restored/{restore_name} {target_time_arg}')
 
 
-def _barman_config(source_id: str, db_host: str):
-    return f"""[{source_id}]
-description = "Streaming replication backup for cluster {source_id}"
+def _barman_config(source: BackupSource):
+    return f"""[{source.cluster.cluster_id}]
+description = "Streaming replication backup for cluster {source.cluster.cluster_id}"
 streaming_archiver = on
 backup_method = postgres
-streaming_conninfo = host={db_host} user=replicator dbname=postgres password=$REPLICATION_PASSWORD_{source_id}
+streaming_conninfo = host={source.pgproxy_hostname} user=replicator dbname=postgres password=$REPLICATION_PASSWORD_{source.cluster.cluster_id}
 slot_name = barman
 create_slot = manual
-conninfo = host={db_host} user=superuser dbname=postgres password=$SUPERUSER_PASSWORD_{source_id}
+conninfo = host={source.pgproxy_hostname} user=superuser dbname=postgres password=$SUPERUSER_PASSWORD_{source.cluster.cluster_id}
+
+minimum_redundancy = {source.minimum_redundancy}
+retention_policy = RECOVERY WINDOW OF {source.recovery_window} DAYS
 """
+
+
+def _barman_crontab(sources: list[BackupSource]):
+    lines = []
+    for source in sources:
+        lines.append(f'{source.frequency} barman /usr/bin/barman -q backup "{source.cluster.cluster_id}"')
+    return '\n'.join(lines) + '\n'

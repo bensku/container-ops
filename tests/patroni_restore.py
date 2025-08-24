@@ -25,9 +25,16 @@ CLUSTER_CONFIG = patroni.ClusterConfig(
         'containerops-3.etcd.containerops.test:2379',
     ],
     etcd_client_group='patroni-test',
-    barman_backup_support=True,
-    restore_from_backup=True
+    barman_backup_support=False,
+    restore_from_backup='/var/containerops/data/barman_restored/restore1'
 )
+
+@deploy('Restore Patroni cluster from backup')
+def restore_backup():
+    patroni.restore_backup(
+        cluster_id='test',
+        restore_name='restore1',
+    )
 
 
 @deploy('Patroni cluster')
@@ -49,4 +56,6 @@ def patroni_cluster():
     )
 
 
+if host.name == 'containerops-1':
+    restore_backup()
 patroni_cluster()
