@@ -308,7 +308,7 @@ Image={spec.image}
 
 [Service]
 Restart=always
-ExecReload=/usr/bin/podman kill -s {spec.reload_signal} --cidfile=%t/%N.cid
+ReloadSignal={spec.reload_signal}
 
 [Install]
 WantedBy=multi-user.target default.target
