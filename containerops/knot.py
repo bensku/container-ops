@@ -77,12 +77,9 @@ class Remote:
             note that they run on port 5300 in internal network. Remember
             to specify this (e.g. '1.2.3.4@5300') and permit traffic in
             endpoint firewalls!
-        tsig_key: Optional TSIG key for zone transfers to this remote.
-            Incoming transfers do not currently support key authentication.
     """
     name: str
     address: str
-    tsig_key: str = field(default=None, repr=False)
 
 
 @operation()
@@ -117,7 +114,7 @@ log:
 """
     
     # List remotes we'll refer to later
-    remotes: list[Remote] = []
+    remotes = []
     for zone in zones:
         if zone.transfer_from:
             remotes.append(zone.transfer_from)
@@ -128,9 +125,6 @@ log:
         main_config += f'''  - id: {remote.name}
     address: {remote.address}
 '''
-        if remote.tsig_key:
-            main_config += f'''    key: {remote.name}-remote-key
-'''
     
     # Create keys for zones that allow dynamic updates
     main_config += 'key:\n'
@@ -139,12 +133,6 @@ log:
             main_config += f'''  - id: {zone.domain}-acme-key
     algorithm: hmac-sha256
     secret: {zone.acme_config.tsig_key}
-'''
-        for remote in zone.transfer_to:
-            if remote.tsig_key:
-                main_config += f'''  - id: {remote.name}-remote-key
-    algorithm: hmac-sha256
-    secret: {remote.tsig_key}
 '''
     # Create ACLs for zones that allow dynamic updates
     main_config += 'acl:\n'
