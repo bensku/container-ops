@@ -173,7 +173,6 @@ log:
                 image=image,
                 command='knotd',
                 volumes=volumes,
-                reload_signal='SIGHUP'
             )
         ],
         ports=[
