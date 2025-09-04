@@ -388,7 +388,7 @@ def _nebula_config(network: Network, hostname: str, ip: str, is_lighthouse: bool
         # NAT hole punching in case some endpoints are behind NATs
         # TODO make this configurable if user wants to reduce "unnecessary" network chatter
         'punchy': {
-            'enabled': True,
+            'punch': True,
             'respond': True,
         },
         'tun': {
