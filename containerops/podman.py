@@ -37,6 +37,8 @@ class Container:
         dependencies: List of containers that this container needs.
             The dependencies are started before this container, and if they
             go down, this container is KILLED! Optional.
+        restart_delay: When container comes down, how many seconds to wait
+            before attempting to restart it. Defaults to 15.
         present: By default, container is deployed. Set this to False to
             delete it instead.
     """
@@ -57,6 +59,7 @@ class Container:
     sysctls: list[tuple[str, str]] = field(default_factory=list)
 
     dependencies: list[str] = field(default_factory=list)
+    restart_delay: int = field(default=15)
     present: bool = field(default=True)
 
     def __repr__(self):
@@ -290,6 +293,7 @@ def container(spec: Container, pod_name: str = None, required_svcs: list[str] = 
 Description={f'{pod_name} - {spec.name}' if pod_name else spec.name}
 {'\n'.join([f'Requires={pod_prefix}{c}.service\nAfter={pod_prefix}{c}.service' for c in spec.dependencies])}
 {'\n'.join([f'Requires={svc}.service\nAfter={svc}.service' for svc in required_svcs])}
+StartLimitIntervalSec=0
 
 [Container]
 ContainerName={service_name}
@@ -309,6 +313,7 @@ ReloadSignal={spec.reload_signal}
 
 [Service]
 Restart=always
+RestartSec={spec.restart_delay}s
 
 [Install]
 WantedBy=multi-user.target default.target
