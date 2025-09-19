@@ -365,6 +365,6 @@ def secret(secret_name: str, source: str, json_key: str = None, present: bool = 
         if old_value:
             old_value = old_value.strip()
         if value != old_value:
-            yield StringCommand('echo -n', MaskString(f'"{value}"'), '|', 'podman secret create --replace', secret_name, '-')
+            yield StringCommand('echo -n', MaskString(f"'{value}'"), '|', 'podman secret create --replace', secret_name, '-')
     else:
         yield StringCommand('podman secret rm --ignore', secret_name)
