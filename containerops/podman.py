@@ -301,7 +301,7 @@ Image={spec.image}
 ReloadSignal={spec.reload_signal}
 {f'Pod={pod_name}.pod' if pod_name else ''}
 {'\n'.join([f'Volume={f'/etc/containerops/configs/{v[0].id}' if type(v[0]) == ConfigFile else v[0]}:{v[1]}' for v in spec.volumes])}
-{'\n'.join([f'Environment={e[0]}={e[1]}' for e in spec.environment])}
+{'\n'.join([f'Environment={e[0]}="{e[1]}"' for e in spec.environment])}
 {'\n'.join([f'Secret={secret_ids[i]},type=env,target={secret[0]}' for i, secret in enumerate(spec.secrets)])}
 
 {f'Entrypoint={spec.entrypoint}' if spec.entrypoint else ''}
