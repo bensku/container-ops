@@ -51,7 +51,7 @@ def node(pod_name: str, hostname: str,
             it is destroyed instead. Data stored in RDB/AOF files is NOT deleted
             automatically.
     """
-    main_config = _valkey_config(rdb_config, use_aof, custom_config, hostname, sentinel_config is not None)
+    main_config = _valkey_config(rdb_config, use_aof, custom_config, hostname, sentinel_config is not None, sentinel_config.master_hostname if sentinel_config else None)
     containers = [podman.Container(
         name='valkey',
         image=image,
@@ -115,7 +115,7 @@ def _firewall(internal_group: str, allow_groups: list[str]) -> nebula.Firewall:
     )
 
 
-def _valkey_config(rdb_config: str, use_aof: bool, custom_config: str, hostname: str, sentinel_enabled: bool):
+def _valkey_config(rdb_config: str, use_aof: bool, custom_config: str, hostname: str, sentinel_enabled: bool, master_hostname: str):
     config = ''
     if rdb_config == '':
         config += 'save ""\n'
@@ -125,6 +125,8 @@ def _valkey_config(rdb_config: str, use_aof: bool, custom_config: str, hostname:
         config += 'appendonly yes\n'
     if sentinel_enabled:
         config += f'replica-announce-ip {hostname}\n'
+        if hostname != master_hostname:
+            config += f'replicaof {master_hostname} 6379\n'
     config += custom_config
     return config
     
