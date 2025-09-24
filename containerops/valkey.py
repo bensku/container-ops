@@ -55,10 +55,11 @@ def node(pod_name: str, hostname: str,
     containers = [podman.Container(
         name='valkey',
         image=image,
+        command=f'sh -c "cp /usr/local/etc/valkey/valkey-readonly.conf /usr/local/etc/valkey/valkey.conf && exec valkey-server /usr/local/etc/valkey/valkey.conf"',
         volumes=[
             # Ask Podman to fix Selinux labels for us for the host directory
             (f'/var/containerops/data/valkey/{pod_name}', '/data:Z'),
-            (podman.ConfigFile(id=f'{pod_name}-valkey-config', data=main_config), '/usr/local/etc/valkey/valkey.conf'),
+            (podman.ConfigFile(id=f'{pod_name}-valkey-config', data=main_config), '/usr/local/etc/valkey/valkey-readonly.conf'),
         ]
     )]
     if sentinel_config is not None:
