@@ -40,6 +40,11 @@ class Network:
         lighthouses: List of lighthouses and their addresses. These do not need
             to be set to create CA or certificates, but should be set when
             actual endpoints are created.
+        nat_punch: Whether to enable NAT hole punching. This is likely required
+            if you are using IPv4 and are behind NAT. However, toggling this on
+            will make Nebula rather chatty, which may be labeled by routers as
+            suspicious. Said suspicious traffic might then be dropped silently.
+            Therefore, this defaults to False.
         underlay_port_range: Port range to use for encrypted UDP traffic of
             endpoints. Each endpoint may explicitly specify its own port,
             overriding this.
@@ -54,6 +59,7 @@ class Network:
     cidr: str
     epoch: int
     lighthouses: list[tuple[str, str]] = field(repr=False)
+    nat_punch: bool = field(default=False, repr=False)
 
     underlay_port_range: tuple[int, int] = field(default=(12500, 13000), repr=False)
     failover_etcd: list[str] = field(default_factory=list, repr=False)
@@ -388,8 +394,8 @@ def _nebula_config(network: Network, hostname: str, ip: str, is_lighthouse: bool
         # NAT hole punching in case some endpoints are behind NATs
         # TODO make this configurable if user wants to reduce "unnecessary" network chatter
         'punchy': {
-            'punch': True,
-            'respond': True,
+            'punch': network.nat_punch,
+            'respond': network.nat_punch,
         },
         'tun': {
             'disabled': False, # Lighthouses need TUN for DNS
