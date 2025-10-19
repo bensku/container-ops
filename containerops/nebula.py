@@ -219,6 +219,29 @@ def _update_state(cert_dir: str, state: str):
         f.write(state)
 
 
+@dataclass
+class LocalAllowList:
+    """
+    Configures which local addresses a Nebula endpoint advertises to lighthouses.
+    Interface rules are regular expressions on Linux interface names, and are
+    matched before CIDR rules.
+
+    Each rule is a tuple of (target, allow), where allow can be set to False to
+    prohibit advertising addresses that match the rule.
+    """
+    interfaces: list[tuple[str, bool]] = field(default_factory=list)
+    cidrs: list[tuple[str, bool]] = field(default_factory=list)
+
+
+# Disallow container interfaces by default
+_LOCAL_ALLOW_LIST_DEFAULT = LocalAllowList(
+    interfaces=[
+        ('docker.*', False),
+        ('podman.*', False),
+    ]
+)
+
+
 @operation()
 def endpoint(
         network: Network,
@@ -230,6 +253,7 @@ def endpoint(
         is_lighthouse: bool = False,
         underlay_port: int = None,
         failover: bool = False,
+        local_allow_list: LocalAllowList = _LOCAL_ALLOW_LIST_DEFAULT,
         pod: str = None,
         present: bool = True
     ):
@@ -266,6 +290,9 @@ def endpoint(
             When the currently active endpoint goes down for any reason,
             another one will automatically take its place within a few dozen
             seconds.
+        local_allow_list: Configure which local underlay addresses this endpoint
+            will advertise to lighthouses. The default is to include everything
+            except Podman and Docker bridge networks.
         pod: If set, this endpoint will be created within a Podman pod.
             If the pod has been deployed with container-ops, use
             nebula.pod_endpoint() instead to get functional DNS for free!
@@ -325,7 +352,7 @@ def endpoint(
     cert_value = f'/etc/containerops/nebula/networks/{network.name}/endpoint/{hostname}/host.crt'
     key_value = f'/etc/containerops/nebula/networks/{network.name}/endpoint/{hostname}/host.key'
     config = StringIO(json.dumps(_nebula_config(network, hostname, ip, is_lighthouse, underlay_port, firewall,
-                                                ca_value, cert_value, key_value), indent=4, sort_keys=True))
+                                                ca_value, cert_value, key_value, local_allow_list), indent=4, sort_keys=True))
     config_changed = host.get_fact(Sha1File, path=config_path) != files.get_file_sha1(config)
     
     unit_file = StringIO(_nebula_unit(network, hostname, config_path, pod, failover))
@@ -363,13 +390,21 @@ def endpoint(
 
 
 def _nebula_config(network: Network, hostname: str, ip: str, is_lighthouse: bool, underlay_port: int, firewall: Firewall,
-                   ca_value: str, cert_value: str, key_value: str) -> dict:
+                   ca_value: str, cert_value: str, key_value: str, local_allow_list: LocalAllowList) -> dict:
     # Make sure the firewall permits essential things like our internal DNS!
     firewall = _patch_firewall(firewall)
 
     lighthouse_map = {}
     for lh in network.lighthouses:
         lighthouse_map[lh[0]] = lh[1]
+
+    allow_list_cfg = None
+    if not is_lighthouse:
+        allow_list_cfg = {
+            'interfaces': {rule[0]: rule[1] for rule in local_allow_list.interfaces},
+            **{rule[0]: rule[1] for rule in local_allow_list.cidrs},
+        }
+
     return {
         # Point to CA cert and host key material that should've been already uploaded
         'pki': {
@@ -386,6 +421,7 @@ def _nebula_config(network: Network, hostname: str, ip: str, is_lighthouse: bool
             'serve_dns': is_lighthouse,
             'dns': { 'host': ip, 'port': 53, } if is_lighthouse else None,
             'hosts': list([l[0] for l in network.lighthouses] if not is_lighthouse else []),
+            'local_allow_list': allow_list_cfg
         },
         'listen': {
             'host': '::', # All interfaces, both IPv4 and IPv6
