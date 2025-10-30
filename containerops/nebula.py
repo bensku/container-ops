@@ -15,9 +15,9 @@ NEBULA_DOWNLOAD = 'https://github.com/slackhq/nebula/releases/download/v1.9.5/ne
 NEBULA_HASH = 'af57ded8f3370f0486bb24011942924b361d77fa34e3478995b196a5441dbf71'
 
 # TODO arm64 support
-NEBULA_NETNS_DOWNLOAD = 'https://github.com/bensku/nebula-netns/releases/download/v1.9.5-netns0/nebula-netns-linux-amd64'
-NEBULA_NETNS_HASH = 'bdd56dfce37cc550fe0cc00c7b0232310c2ddd0d72b1f35c992b46f456f40d91'
-CONTAINER_NEBULA_DOWNLOAD = 'https://github.com/bensku/nebula-netns/releases/download/v1.9.5-netns0/container-nebula.sh'
+NEBULA_NETNS_DOWNLOAD = 'https://github.com/bensku/nebula-netns/releases/download/v1.9.7-netns0/nebula-netns-linux-amd64'
+NEBULA_NETNS_HASH = '9baea451528135ea5dfda4f0ca0f46651c587c2858ac13eb1f155689627f1bf4'
+CONTAINER_NEBULA_DOWNLOAD = 'https://github.com/bensku/nebula-netns/releases/download/v1.9.7-netns0/container-nebula.sh'
 CONTAINER_NEBULA_HASH = 'd1b4f29ec04c98f58acf3c9148cfacefd65e856e36379b4ca77c01d330c94084'
 
 FAILOVERD_DOWNLOAD = 'https://github.com/bensku/failoverd/releases/download/v0.0.1/failoverd-amd64'
