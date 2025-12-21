@@ -1,8 +1,40 @@
 from dataclasses import dataclass
+import base64
 import json
-import shutil
 from containerops import nebula, _ipam as ipam
 import os
+import segno
+import re
+
+
+_QR_HTML_TEMPLATE = '''
+<!DOCTYPE html>
+<html><head>
+<meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Nebula</title>
+<style>
+body{{font:14px monospace;padding:8px}}
+h2{{font-size:16px;margin:8px 0}}
+pre{{background:#eee;padding:8px;white-space:pre-wrap;word-break:break-all}}
+button{{margin-left:8px;padding:2px 8px}}
+</style>
+<script>
+function c(id){{var t=document.getElementById(id).innerText,a=document.createElement('textarea');a.value=t;document.body.appendChild(a);a.select();document.execCommand('copy');document.body.removeChild(a)}}
+</script>
+</head><body>
+<h2>CA <button onclick="c('ca')">Copy</button></h2>
+<pre id=ca>{ca}</pre>
+<h2>Cert <button onclick="c('cert')">Copy</button></h2>
+<pre id=cert>{cert}</pre>
+<h2>Key <button onclick="c('key')">Copy</button></h2>
+<pre id=key>{key}</pre>
+<h2>Hosts</h2>
+{hosts}
+</body></html>
+'''
+
+_QR_MAX_BYTES = 2900
 
 
 @dataclass
@@ -35,7 +67,12 @@ def systemd_svc_installer(endpoint: Endpoint, out_dir: str):
     # Create configurations
     config = _bundled_config(endpoint)
     config_path = f'/etc/containerops-vpn/{client_id}/config.json'
-    unit = nebula._nebula_unit(endpoint.network, endpoint.hostname, config_path)
+    nebula_path = f'/opt/containerops-vpn/{client_id}/nebula'
+    unit = nebula._nebula_unit(
+        endpoint.network,
+        endpoint.hostname,
+        config_path,
+        nebula_path='')
 
     # Create script that installs (or uninstalls) everything
     script = f"""#!/bin/sh
@@ -57,13 +94,20 @@ EOF
 )
 
 if [ "$op" = "install" ]; then
-    echo "Downloading Nebula client..."
     mkdir -p /opt/containerops-vpn/{client_id}
-    wget -q -O /opt/containerops-vpn/{client_id}/nebula {nebula.NEBULA_NETNS_DOWNLOAD}
-    chmod +x /opt/containerops-vpn/{client_id}/nebula
+    echo "Downloading Nebula client..."
+    nebula_path={nebula_path}
+    wget -q -O $nebula_path {nebula.NEBULA_NETNS_DOWNLOAD}
+    echo "Making client service executable"
+    chmod +x $nebula_path
+    if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce)" != "Disabled" ]; then
+        semanage fcontext -a -t bin_t $nebula_path
+        restorecon -v $nebula_path
+    fi
 
     echo "Installing configuration..."
     mkdir -p /etc/containerops-vpn/{client_id}
+    chmod 700 /etc/containerops-vpn/{client_id}
     printf '%s' "$config" > /etc/containerops-vpn/{client_id}/config.json
 
     echo "Setting up systemd service..."
@@ -99,6 +143,36 @@ fi
     os.chmod(f'{out_dir}/install_service.sh', 0o755)
 
 
+def mobile_nebula_qrcode(endpoint: Endpoint, out_dir: str):
+    """Generate QR code with data URL containing Nebula credentials."""
+    # Generate per-host HTML with individual copy buttons for overlay IP and public endpoint
+    hosts_html = ''.join(
+        f'<div><code id=o{i}>{lh[0]}</code><button onclick="c(\'o{i}\')">Copy</button> '
+        f'<code id=h{i}>{lh[1]}</code><button onclick="c(\'h{i}\')">Copy</button></div>'
+        for i, lh in enumerate(endpoint.network.lighthouses)
+    )
+
+    # Strip template newlines first, then format with data (preserving cert newlines)
+    template = re.sub(r'\n\s*', '', _QR_HTML_TEMPLATE)
+    html = template.format(
+        ca=endpoint.ca_data.strip(),
+        cert=endpoint.cert_data.strip(),
+        key=endpoint.key_data.strip(),
+        hosts=hosts_html
+    )
+
+    html_b64 = base64.b64encode(html.encode('utf-8')).decode('ascii')
+    data_url = f'data:text/html;base64,{html_b64}'
+
+    if len(data_url) > _QR_MAX_BYTES:
+        raise ValueError(f'QR data ({len(data_url)} bytes) exceeds max ({_QR_MAX_BYTES})')
+
+    qr = segno.make(data_url, error='L')
+    qr_path = f'{out_dir}/mobile-qrcode.png'
+    qr.save(qr_path, scale=8, border=4)
+    return qr_path
+
+
 def _bundled_config(endpoint: Endpoint) -> str:
     config = nebula._nebula_config(
         network=endpoint.network,
@@ -110,7 +184,8 @@ def _bundled_config(endpoint: Endpoint) -> str:
         # Embed key material directly in config
         ca_value=endpoint.ca_data,
         cert_value=endpoint.cert_data,
-        key_value=endpoint.key_data
+        key_value=endpoint.key_data,
+        local_allow_list=nebula._LOCAL_ALLOW_LIST_DEFAULT
     )
     return json.dumps(config, indent=4, sort_keys=True)
 
@@ -156,6 +231,7 @@ def _new_client(state_dir: str, net_name: str, hostname: str, groups: list[str],
     os.makedirs(out_dir, exist_ok=True)
 
     systemd_svc_installer(endpoint, out_dir)
+    mobile_nebula_qrcode(endpoint, out_dir)
 
 
 if __name__ == '__main__':

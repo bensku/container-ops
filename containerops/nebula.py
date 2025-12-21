@@ -482,7 +482,14 @@ def _convert_fw_rule(rule: FirewallRule):
         } for group in groups]
 
 
-def _nebula_unit(network: Network, hostname: str, config_path: str, target_pod: str = None, failover: bool = False):
+def _nebula_unit(network: Network, hostname: str, config_path: str, target_pod: str = None, failover: bool = False,
+                 nebula_path: str = None):
+    if nebula_path:
+        entrypoint = nebula_path
+    elif target_pod:
+        entrypoint = f'/opt/containerops/nebula/container-nebula.sh {target_pod}-infra'
+    else:
+        entrypoint = '/opt/containerops/nebula/nebula-netns'
     return f'''
 [Unit]
 Description=Nebula overlay - {hostname} ({network.name})
@@ -493,7 +500,7 @@ After=network-online.target
 
 [Service]
 ExecStartPre=/opt/containerops/nebula/nebula-netns -test -config {config_path}
-ExecStart={f'/opt/containerops/nebula/container-nebula.sh {target_pod}-infra' if target_pod else '/opt/containerops/nebula/nebula-netns'} -config {config_path}
+ExecStart={entrypoint} -config {config_path}
 ExecReload=/bin/kill -HUP $MAINPID
 Environment="NEBULA_NETNS_BINARY=/opt/containerops/nebula/nebula-netns"
 
