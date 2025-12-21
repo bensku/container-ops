@@ -1,8 +1,11 @@
 from dataclasses import dataclass, field
+from io import StringIO
+from pyinfra import host
 from pyinfra.api import operation
-from pyinfra.operations import files
+from pyinfra.operations import files, systemd
+from pyinfra.facts.files import Sha1File
 
-from containerops import nebula, podman
+from containerops import nebula, podman, _ipam as ipam
 
 
 @dataclass
@@ -51,28 +54,43 @@ def node(pod_name: str, hostname: str,
             it is destroyed instead. Data stored in RDB/AOF files is NOT deleted
             automatically.
     """
-    main_config = _valkey_config(rdb_config, use_aof, custom_config, hostname, sentinel_config is not None, sentinel_config.master_hostname if sentinel_config else None)
+    config_dir = f'/etc/containerops/configs/{pod_name}-valkey'
+    yield from files.directory._inner(config_dir)
+
+    # Check server's read-only config copy against local config for changes
+    main_config = _valkey_config(network, rdb_config, use_aof, custom_config, hostname, sentinel_config is not None, sentinel_config.master_hostname if sentinel_config else None)
+    main_config_file = f'{config_dir}/valkey.conf'
+    restart_pod = False
+    if files.get_file_sha1(StringIO(main_config)) != host.get_fact(Sha1File, path=f'{main_config_file}-readonly'):
+        # Configuration updated, update also the read-write config (overwriting changes made by Valkey)
+        yield from files.put._inner(src=StringIO(main_config), dest=f'{main_config_file}-readonly')
+        yield from files.put._inner(src=StringIO(main_config), dest=main_config_file)
+        restart_pod = True
     containers = [podman.Container(
         name='valkey',
         image=image,
-        command=f'sh -c "cp /usr/local/etc/valkey/valkey-readonly.conf /usr/local/etc/valkey/valkey.conf && exec valkey-server /usr/local/etc/valkey/valkey.conf"',
+        command='valkey-server /usr/local/etc/valkey/valkey.conf',
         volumes=[
             # Ask Podman to fix Selinux labels for us for the host directory
             (f'/var/containerops/data/valkey/{pod_name}', '/data:Z'),
-            (podman.ConfigFile(id=f'{pod_name}-valkey-config', data=main_config), '/usr/local/etc/valkey/valkey-readonly.conf'),
+            (config_dir, '/usr/local/etc/valkey:Z')
         ]
     )]
+
     if sentinel_config is not None:
+        # Same update handling as above for sentinel config
+        sentinel_config_content = _sentinel_config(network, hostname, sentinel_config)
+        sentinel_config_file = f'{config_dir}/sentinel.conf'
+        if files.get_file_sha1(StringIO(sentinel_config_content)) != host.get_fact(Sha1File, path=f'{sentinel_config_file}-readonly'):
+            yield from files.put._inner(src=StringIO(sentinel_config_content), dest=f'{sentinel_config_file}-readonly')
+            yield from files.put._inner(src=StringIO(sentinel_config_content), dest=sentinel_config_file)
+            restart_pod = True
+
         containers.append(podman.Container(
             name='sentinel',
             image=image,
-            command='sh -c "cp /usr/local/etc/valkey/sentinel-readonly.conf /usr/local/etc/valkey/sentinel.conf && exec valkey-sentinel /usr/local/etc/valkey/sentinel.conf"',
-            # FIXME since sentinel edits config files, we'll trigger restart every time
-            # This shouldn't normally cause Valkey outage, but with enough bad luck, that can happen!
-            volumes=[(podman.ConfigFile(
-                id=f'{pod_name}-sentinel-config',
-                data=_sentinel_config(hostname, sentinel_config),
-            ), '/usr/local/etc/valkey/sentinel-readonly.conf')]
+            command='valkey-sentinel /usr/local/etc/valkey/sentinel.conf',
+            volumes=[(config_dir, '/usr/local/etc/valkey:Z')]
         ))
 
     internal_group = f'valkey-internal-{sentinel_config.cluster_id}' if sentinel_config else None
@@ -83,12 +101,18 @@ def node(pod_name: str, hostname: str,
         groups=[internal_group] if internal_group else [],
     )
     yield from files.directory._inner(path=f'/var/containerops/data/valkey/{pod_name}')
+
+    if restart_pod:
+        yield from systemd.service._inner(service=f'{pod_name}-pod', running=False)
     yield from podman.pod._inner(
         pod_name=pod_name,
         containers=containers,
         networks=[endpoint],
         present=present
     )
+
+    if restart_pod:
+        yield from systemd.service._inner(service=f'{pod_name}-pod', running=True, restarted=True)
 
 
 def _firewall(internal_group: str, allow_groups: list[str]) -> nebula.Firewall:
@@ -116,7 +140,7 @@ def _firewall(internal_group: str, allow_groups: list[str]) -> nebula.Firewall:
     )
 
 
-def _valkey_config(rdb_config: str, use_aof: bool, custom_config: str, hostname: str, sentinel_enabled: bool, master_hostname: str):
+def _valkey_config(network: nebula.Network, rdb_config: str, use_aof: bool, custom_config: str, hostname: str, sentinel_enabled: bool, master_hostname: str):
     config = ''
     if rdb_config == '':
         config += 'save ""\n'
@@ -125,22 +149,46 @@ def _valkey_config(rdb_config: str, use_aof: bool, custom_config: str, hostname:
     if use_aof:
         config += 'appendonly yes\n'
     if sentinel_enabled:
-        config += f'replica-announce-ip {hostname}\n'
+        ip = ipam.allocate_ip(
+            network_name=network.name,
+            hostname=hostname,
+            cidr=network.cidr,
+            base_dir=f'{network.state_dir}/networks',
+        )
+        config += f'replica-announce-ip {ip}\n'
         if hostname != master_hostname:
-            config += f'replicaof {master_hostname} 6379\n'
+            master_ip = ipam.allocate_ip(
+                network_name=network.name,
+                hostname=master_hostname,
+                cidr=network.cidr,
+                base_dir=f'{network.state_dir}/networks',
+            )
+            config += f'replicaof {master_ip} 6379\n'
     config += custom_config
     return config
     
 
-def _sentinel_config(hostname: str, config: SentinelConfig):
-    return f"""sentinel monitor mymaster {config.master_hostname} 6379 {config.quorum}
+def _sentinel_config(network: nebula.Network, hostname: str, config: SentinelConfig):
+    ip = ipam.allocate_ip(
+        network_name=network.name,
+        hostname=hostname,
+        cidr=network.cidr,
+        base_dir=f'{network.state_dir}/networks',
+    )
+    master_ip = ipam.allocate_ip(
+        network_name=network.name,
+        hostname=config.master_hostname,
+        cidr=network.cidr,
+        base_dir=f'{network.state_dir}/networks',
+)
+    return f"""sentinel monitor mymaster {master_ip} 6379 {config.quorum}
 sentinel down-after-milliseconds mymaster {config.down_after_ms}
 sentinel failover-timeout mymaster {config.failover_timeout_ms}
 sentinel parallel-syncs mymaster {config.parallel_syncs}
 
-sentinel announce-ip {hostname}
-sentinel resolve-hostnames yes
-sentinel announce-hostnames yes
+sentinel announce-ip {ip}
+sentinel resolve-hostnames no
+sentinel announce-hostnames no
 {config.custom_config}
 
 # PRE-GENERATED END

@@ -45,6 +45,8 @@ class Network:
             will make Nebula rather chatty, which may be labeled by routers as
             suspicious. Said suspicious traffic might then be dropped silently.
             Therefore, this defaults to False.
+        inactive_timeout: Timeout for dropping inactive connections. Defaults
+            to 1m (1 minute). Can be set to None to disable this feature.
         underlay_port_range: Port range to use for encrypted UDP traffic of
             endpoints. Each endpoint may explicitly specify its own port,
             overriding this.
@@ -60,6 +62,7 @@ class Network:
     epoch: int
     lighthouses: list[tuple[str, str]] = field(repr=False)
     nat_punch: bool = field(default=False, repr=False)
+    inactive_timeout: str = field(default='1m', repr=False)
 
     underlay_port_range: tuple[int, int] = field(default=(12500, 13000), repr=False)
     failover_etcd: list[str] = field(default_factory=list, repr=False)
@@ -444,6 +447,10 @@ def _nebula_config(network: Network, hostname: str, ip: str, is_lighthouse: bool
         },
         'logging': {
             'level': 'info', # TODO debug logging support
+        },
+        'tunnels': {
+            'drop_inactive': network.inactive_timeout != None,
+            'inactivity_timeout': network.inactive_timeout
         },
         '_ip': ip,
     }
