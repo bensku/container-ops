@@ -495,7 +495,7 @@ def _nebula_unit(network: Network, hostname: str, config_path: str, target_pod: 
 Description=Nebula overlay - {hostname} ({network.name})
 Wants=network-online.target
 After=network-online.target
-{f'Requires={target_pod}-pod.service\nAfter={target_pod}-pod.service' if target_pod else ''}
+{f'BindsTo={target_pod}-pod.service\nAfter={target_pod}-pod.service' if target_pod else ''}
 {f'Requires=nebula-{hostname}-failover.service' if failover else ''}
 
 [Service]

@@ -192,6 +192,7 @@ DNS=127.0.0.1
 
 [Service]
 Restart=always
+StopWhenUnneeded=no
 
 [Install]
 WantedBy=multi-user.target default.target
