@@ -37,8 +37,6 @@ class Container:
         dependencies: List of containers that this container needs.
             The dependencies are started before this container, and if they
             go down, this container is KILLED! Optional.
-        restart_delay: When container comes down, how many seconds to wait
-            before attempting to restart it. Defaults to 15.
         present: By default, container is deployed. Set this to False to
             delete it instead.
     """
@@ -59,7 +57,6 @@ class Container:
     sysctls: list[tuple[str, str]] = field(default_factory=list)
 
     dependencies: list[str] = field(default_factory=list)
-    restart_delay: int = field(default=15)
     present: bool = field(default=True)
 
     def __repr__(self):
@@ -183,16 +180,18 @@ Internal={'false' if HOST_NAT in networks else 'true'}
     # Deploy the actual pod
     pod_unit = f"""[Unit]
 Description={pod_name} - pod
+StartLimitIntervalSec=0
 
 [Pod]
 PodName={pod_name}
+ExitPolicy=continue
 Network={pod_name}.network
 DNS=127.0.0.1
 {'\n'.join([f'PublishPort={p[0]}:{p[1]}/{p[2] if len(p) > 2 else "tcp"}' for p in ports])}
 
 [Service]
 Restart=always
-StopWhenUnneeded=no
+RestartSec=3
 
 [Install]
 WantedBy=multi-user.target default.target
@@ -314,7 +313,7 @@ ReloadSignal={spec.reload_signal}
 
 [Service]
 Restart=always
-RestartSec={spec.restart_delay}s
+RestartSec=3
 
 [Install]
 WantedBy=multi-user.target default.target
